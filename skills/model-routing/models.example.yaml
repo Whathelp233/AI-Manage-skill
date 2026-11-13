@@ -1,0 +1,42 @@
+pool:
+  - id: gpt-6-luna
+    executor: codex
+    status: active
+    evaluated: true
+    note: ""
+  - id: gpt-6.1-sol
+    executor: codex
+    status: active
+    evaluated: true
+    note: ""
+  - id: gpt-6-astra
+    executor: codex
+    status: retired
+    evaluated: false
+    note: 用户 2026-11-13 移出池，不评测
+  - id: claude-haiku-5-5
+    alias: haiku
+    executor: claude
+    status: candidate
+    evaluated: false
+    note: ""
+  - id: deepseek-flash
+    executor: dsh
+    status: active
+    evaluated: false
+    note: 兜底，不参与路由
+routing:
+  A: [gpt-6-luna, gpt-6.1-sol]
+  B: [gpt-6.1-sol]
+  C: [gpt-6.1-sol]
+rework:
+  same_defect_rounds: 2
+  total_rounds: 3
+thresholds:
+  median_time_ratio: 0.7
+  cost_ratio: 0.5
+  reeval_min_records: 8
+  reeval_window: 20
+  reeval_rate: 0.30
+  rework_records_min: 20
+  rework_rescue_rate: 0.15
