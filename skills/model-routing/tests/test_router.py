@@ -25,13 +25,14 @@ class RouterTests(unittest.TestCase):
         self.config.write_text(yaml.safe_dump({
             "pool": [
                 {"id": "gpt-6-luna", "executor": "codex", "status": "active", "evaluated": True, "note": "test model", "alias": "luna"},
-                {"id": "gpt-6.1-sol", "executor": "codex", "status": "active", "evaluated": True, "note": "test model"},
+                {"id": "gpt-6.1-sol", "executor": "codex", "status": "active", "evaluated": True, "note": "test model", "effort": "high"},
                 {"id": "gpt-6-astra", "executor": "codex", "status": "active", "evaluated": True, "note": "test model"},
+                {"id": "gpt-6.2-sol", "executor": "codex", "status": "candidate", "evaluated": False, "note": "candidate", "effort": "high"},
                 {"id": "deepseek-flash", "executor": "dsh", "status": "retired", "evaluated": True, "note": "retired test model"},
                 {"id": "claude-haiku-5-5", "executor": "claude", "status": "active", "evaluated": True, "note": "test model", "alias": "haiku"},
             ],
             "routing": {
-                "A": ["gpt-6-luna", "gpt-6.1-sol", "gpt-6-astra", "deepseek-flash"],
+                "A": ["gpt-6-luna", "gpt-6.1-sol", "gpt-6-astra", "gpt-6.2-sol", "deepseek-flash", "claude-haiku-5-5"],
                 "B": ["gpt-6-luna", "gpt-6.1-sol"],
                 "C": ["gpt-6-luna"],
             },
@@ -63,11 +64,43 @@ class RouterTests(unittest.TestCase):
     def test_route_skips_non_active_and_rejects_unknown_category(self):
         code, out, _ = self.run_cli("route", "A")
         self.assertEqual(code, 0)
-        self.assertEqual(out.splitlines(), ["gpt-6-luna", "gpt-6.1-sol", "gpt-6-astra"])
+        self.assertEqual(out.splitlines(), [
+            "gpt-6-luna\tmedium", "gpt-6.1-sol\thigh",
+            "gpt-6-astra\tmedium", "claude-haiku-5-5\t-",
+        ])
         self.assertNotIn("deepseek-flash", out)
+        self.assertNotIn("gpt-6.2-sol", out)
         code, _, err = self.run_cli("route", "D")
         self.assertNotEqual(code, 0)
         self.assertIn("A, B, or C", err)
+
+    def test_effort_is_rejected_for_non_codex_and_when_invalid(self):
+        cfg = yaml.safe_load(self.config.read_text(encoding="utf-8"))
+        next(model for model in cfg["pool"]
+             if model["id"] == "claude-haiku-5-5")["effort"] = "low"
+        self.config.write_text(yaml.safe_dump(cfg), encoding="utf-8")
+        with self.assertRaisesRegex(router.RouterError,
+                                    "only valid for codex"):
+            router.load_config(self.config)
+
+        cfg = yaml.safe_load(self.config.read_text(encoding="utf-8"))
+        claude = next(model for model in cfg["pool"]
+                      if model["id"] == "claude-haiku-5-5")
+        del claude["effort"]
+        next(model for model in cfg["pool"]
+             if model["id"] == "gpt-6-luna")["effort"] = "extreme"
+        self.config.write_text(yaml.safe_dump(cfg), encoding="utf-8")
+        with self.assertRaisesRegex(router.RouterError, "effort must be"):
+            router.load_config(self.config)
+
+    def test_candidate_is_allowed_in_ledger(self):
+        code, _, err = self.run_cli(
+            "log", "--task-id", "candidate-task", "--category", "A",
+            "--executor", "codex", "--model", "gpt-6.2-sol",
+            "--attempt", "0", "--outcome", "pass")
+        self.assertEqual(code, 0, err)
+        row = json.loads(self.ledger.read_text(encoding="utf-8"))
+        self.assertEqual(row["model"], "gpt-6.2-sol")
 
     def test_real_config_passes_format_validation(self):
         config = ROOT / "models.example.yaml"
@@ -101,6 +134,30 @@ class RouterTests(unittest.TestCase):
         code, _, err = self.log("bad", outcome="invalid")
         self.assertNotEqual(code, 0)
         self.assertIn("invalid outcome", err)
+
+    def test_partial_is_accepted_and_counted_separately(self):
+        self.assertEqual(self.log("partial", outcome="partial")[0], 0)
+        self.assertEqual(self.log("passed", outcome="pass")[0], 0)
+        code, out, _ = self.run_cli("stats")
+        self.assertEqual(code, 0)
+        row = json.loads(out)
+        self.assertEqual(row["first_pass_rate"], 1.0)
+        self.assertEqual(row["partial_rate"], 0.5)
+
+    def test_bad_ledger_lines_are_skipped_and_reported(self):
+        self.assertEqual(self.log("valid")[0], 0)
+        with self.ledger.open("a", encoding="utf-8") as stream:
+            stream.write("{bad json}\n")
+            stream.write(json.dumps({"outcome": "bogus"}) + "\n")
+        code, out, err = self.run_cli("stats")
+        self.assertEqual(code, 0)
+        self.assertEqual(json.loads(out)["records"], 1)
+        self.assertIn("skipped 2 invalid ledger line(s)", err)
+        self.assertIn("line 2:", err)
+        self.assertIn("line 3:", err)
+        code, _, err = self.run_cli("check-reeval")
+        self.assertEqual(code, 0)
+        self.assertIn("skipped 2 invalid ledger line(s)", err)
 
     def test_stats_and_empty_ledger(self):
         code, out, _ = self.run_cli("stats")
@@ -222,7 +279,8 @@ class RouterTests(unittest.TestCase):
         row["ts"] = "not-a-timestamp"
         self.ledger.write_text(json.dumps(row) + "\n", encoding="utf-8")
         code, _, err = self.run_cli("check-reeval")
-        self.assertNotEqual(code, 0)
+        self.assertEqual(code, 0)
+        self.assertIn("line 1:", err)
         self.assertIn("ts must be an ISO8601 timestamp", err)
 
 

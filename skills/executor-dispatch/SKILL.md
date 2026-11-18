@@ -26,15 +26,18 @@ description: 编排者把编码任务派给外部执行器（Codex CLI、Claude 
 ### Codex
 
 ```bash
-CODEX_HOME=~/.codex-exec codex exec -C <项目目录> -m <模型> \
-  -c model_reasoning_effort="medium" -s workspace-write \
+CODEX_HOME=~/.codex-exec python3 <本技能目录>/exec_guard.py codex -- \
+  -C <项目目录> -m <模型> \
+  -c model_reasoning_effort="<强度>" -s workspace-write \
   -o <临时目录>/codex-last.md "<任务指令>" </dev/null
 ```
 
+- 强度取 `router.py route <类>` 输出的第二列；resume 时同样带上该强度。
+- 通过 `exec_guard.py` 运行：Codex（0.167 实测）无法用 `--disable multi_agent` 或 `agents.max_depth=0` 关掉子代理，EXECUTOR.md 的"不要转派"也不总被遵守。exec_guard 监视 `$CODEX_HOME/sessions`，出现本次运行的子线程（首行 `thread_source: "subagent"`）即终止进程组并退出 86。`--` 之后是 `codex exec` 的参数，不要再写 `exec`。
 - 必须 `</dev/null`，否则进程会一直等 stdin。
 - 必须显式 `-m`：不写时使用 `config.toml` 的默认模型，可能是最贵的组合。
 - 非 git 目录加 `--skip-git-repo-check`。
-- 返工用 `codex exec resume <session-id>`，**不要用 `--last`**（可能抢到桌面版正在用的会话）。resume 不保留原会话的模型，也不接受 `-s`：必须加 `-c model="<模型>" -c model_reasoning_effort="medium" -c sandbox_mode="workspace-write"`，并看日志头的 `model:` 行确认。
+- 返工用 `codex exec resume <session-id>`，**不要用 `--last`**（可能抢到桌面版正在用的会话）。resume 不保留原会话的模型，也不接受 `-s`：必须加 `-c model="<模型>" -c model_reasoning_effort="<强度>" -c sandbox_mode="workspace-write"`，并看日志头的 `model:` 行确认。
 - 沙箱里 `.git/` 只读：提交由编排者在宿主执行。
 
 ### Claude Code（Haiku）
@@ -44,11 +47,13 @@ cd <项目目录> && claude -p --model haiku --output-format json \
   --permission-mode auto --setting-sources project \
   --settings '{"claudeMdExcludes":["'"$HOME"'/.claude/CLAUDE.md"]}' \
   --append-system-prompt-file <本技能目录>/EXECUTOR.md \
-  "<任务指令>" </dev/null > <临时目录>/claude-last.json
+  --disallowedTools "Agent,Task" \
+  -- "<任务指令>" </dev/null > <临时目录>/claude-last.json
 ```
 
 - `claudeMdExcludes`：项目在 HOME 下时，Claude Code 会把 `~/.claude/CLAUDE.md` 当作祖先目录的项目指令加载，`--setting-sources project` 挡不住。
 - `--permission-mode auto`：`acceptEdits` 下 Bash/Read/Write 会被拒，执行器无法编译和自测。`--bare` 不走订阅登录。
+- `--disallowedTools "Agent,Task"`：禁止执行器再叫子代理。必须用逗号形式并在任务指令前加 `--`：这个参数接受多个值，写成 `--disallowedTools Agent Task "<任务指令>"` 会把任务指令也当成工具名，执行器收不到任务，否则结果里会混进别的模型（验收时看输出的 `subagent_stats.spawned` 和 `modelUsage` 是否只有所派模型）。
 - 输出 JSON：实际模型 ID 是 `modelUsage` 的键，花费 `total_cost_usd`，续接用 `session_id`。
 
 ### DeepSeek Harness（额度兜底）
@@ -60,6 +65,11 @@ dsh-exec <项目目录> --json - < task.txt > dsh-last.jsonl
 ```
 
 成功 = 退出码 0 且出现 `{"type": "status", "phase": "turn_end", "reason": {"kind": "completed"}}` 事件（`turn_end` 是 `status` 事件的 `phase`，不是独立的 `type`）；`final` 事件不能当作成功依据。
+
+### 通用
+
+- 耗时长的任务放后台运行，完成后再读结果，不要轮询。
+- 执行器沙箱需要联网或越出工作区时先问用户，不要擅自放开沙箱（如 `danger-full-access`）。
 
 ## 3 任务分类与选模型
 
@@ -79,8 +89,9 @@ dsh-exec <项目目录> --json - < task.txt > dsh-last.jsonl
 
 ## 5 验收
 
-- 不看执行器自己的结论，看实际结果：亲自重跑测试、读 diff。
+- 不看执行器自己的结论，看实际结果：亲自重跑测试、读 diff。需要第二意见时可以用 `codex exec review` 做代码审查。
 - 报告第一行 `TESTS: PASS|FAIL|NOT_RUN` 要和你重跑的结果一致。
+- 查是否转派：执行器有没有调用子代理，或在 shell 里调用 `codex`、`claude`、`dsh-exec` 等别的模型 CLI。EXECUTOR.md 禁止转派，但只靠说明不够，要看输出确认。
 - 重点查：是否写了测试；是否改了范围外文件；是否删除或削弱已有测试；测试是否自包含（连续跑两次都通过，不写真实路径）。
 
 ## 6 返工与升级
@@ -94,3 +105,7 @@ dsh-exec <项目目录> --json - < task.txt > dsh-last.jsonl
 ## 7 记账
 
 每次派活结束记一条（见 `model-routing` 技能的 `router.py log`）：任务、类别、模型、第几次交付、结果、耗时、花费。路由表的复评靠这些记录触发。
+
+## 8 攒真实评测题
+
+合成题对强模型很快饱和，真实失败任务才有区分度。C 类任务，以及任何返工过或升级过的任务，派活前在宿主记下起点：git 仓库记提交号（`git rev-parse HEAD`），非 git 目录打一个快照包（不含数据和二进制）。账本 note 里写上提交号或快照路径。验收通过后，修复前的起点加最终的测试就能改造成评测题（见 `model-eval` 技能）。

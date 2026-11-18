@@ -275,7 +275,7 @@ class NamingChecksTest(StyleCheckTestCase):
     def test_function_names_in_header(self):
         self.put("include/a.h", """\
             #pragma once
-            class Pump {
+            class PumpController {
             public:
                 bool request_start(int now_ms);
                 void RequestStop();
@@ -290,13 +290,13 @@ class NamingChecksTest(StyleCheckTestCase):
 
     def test_function_names_in_source(self):
         self.put("src/a.cpp", """\
-            bool Pump::request_start(int now_ms) {
+            bool PumpController::request_start(int now_ms) {
                 return now_ms > 0;
             }
             static bool parse_number(const char* text) {
                 return text != nullptr;
             }
-            void Pump::Stop() {}
+            void PumpController::Stop() {}
             """)
         result = self.check()
         self.assertEqual(self.failed(), ["function_names"])
@@ -318,7 +318,7 @@ class NamingChecksTest(StyleCheckTestCase):
     def test_member_names(self):
         self.put("include/a.h", """\
             #pragma once
-            class Pump {
+            class PumpController {
             private:
                 int batteryLevel_;
                 int m_count;
@@ -360,7 +360,7 @@ class NamingChecksTest(StyleCheckTestCase):
         self.put("src/a.cpp", """\
             // class bad_name {  int fooBar = 1;  #define lower 1
             /* struct another_bad {
-               bool Pump::bad_method() */
+               bool PumpController::bad_method() */
             const char* text = "class bad_name { int fooBar; }";
             const char* raw = R"(enum class E { lower_value };)";
             """)

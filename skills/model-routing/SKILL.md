@@ -18,7 +18,7 @@ description: 维护执行器模型池和按任务类别的路由表，记录每�
 ## 2 常用命令
 
 ```bash
-python3 router.py route A                     # A 类路由顺序（跳过非 active 模型）
+python3 router.py route A                     # 模型与推理强度（跳过非 active 模型）
 python3 router.py log --task-id T1 --category A --executor codex \
     --model gpt-x --attempt 0 --outcome pass --wall-s 120
 python3 router.py stats --category B --last 20
@@ -27,11 +27,24 @@ python3 router.py detect --claude-ids claude-haiku-x-y
 python3 router.py check-reeval                 # 哪些类别需要复评
 ```
 
+`route` 每行按 `<模型>\t<强度>` 输出。Codex 模型未配置强度时为
+`medium`；非 Codex 模型的第二列为 `-`。例如 `route A`：
+
+```text
+gpt-6-luna	max
+gpt-6.1-terra	max
+claude-haiku-5-5	-
+gpt-6.1-sol	high
+```
+
+模型池的 Codex 项可配置 `effort: low | medium | high | xhigh | max | ultra`；
+其他执行器不能设置 `effort`。`candidate` 模型可记账，但不会进入路由。
+
 `--config`、`--ledger` 可覆盖默认路径。
 
 ## 3 账本字段
 
-`ts`、`task_id`、`project`、`category`（A/B/C）、`executor`（codex/claude/dsh）、`model`、`attempt`（首次交付为 0）、`outcome`（pass / fail_test / fail_review / regression / test_gaming / misunderstood / quota / env_error）、`escalated_to`、`wall_s`、`tokens_in`、`tokens_out`、`cost_usd`、`note`。
+`ts`、`task_id`、`project`、`category`（A/B/C）、`executor`（codex/claude/dsh）、`model`、`attempt`（首次交付为 0）、`outcome`（pass / partial / fail_test / fail_review / regression / test_gaming / misunderstood / quota / env_error）、`escalated_to`、`wall_s`、`tokens_in`、`tokens_out`、`cost_usd`、`note`。`partial` 表示执行器完成了它能做的部分，剩余验证（如沙箱内无法运行的端到端、容器或 GPU 验证）由编排者在宿主完成。统计中它单独计入 `partial_rate`，不算首次通过，也不算失败。
 
 账本只追加，不改写。记录的是实际执行的模型（例如 resume 退回了默认模型，就记默认模型）。
 

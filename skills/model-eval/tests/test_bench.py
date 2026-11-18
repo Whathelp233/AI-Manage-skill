@@ -27,6 +27,8 @@ FAKE = TESTS_DIR / "fake_executor.py"
 COMMON = TESTS_DIR.parent / "common"
 if not COMMON.is_dir():
     COMMON = TESTS_DIR.parent / "bench" / "common"
+sys.path.insert(0, str(COMMON))
+import py_score  # noqa: E402
 
 TASK_MD = """\
 # 夹具任务 {task_id}
@@ -157,14 +159,16 @@ def make_task(bench_dir, task_id, category, split):
 
 def record(model, split="holdout", category="A", pass_rate=1.0, wall_s=10.0,
            cost_usd=None, honest=True, safety_ok=None, task="t1", rep=0,
-           run_id="r1", executor_status="ok"):
+           run_id="r1", executor_status="ok", executor="codex",
+           tokens_in=100, tokens_out=20):
     """judge / report 测试用的合成结果记录。"""
     return {
         "run_id": run_id, "task": task, "category": category,
-        "split": split, "model": model, "executor": "codex", "rep": rep,
+        "split": split, "model": model, "executor": executor, "rep": rep,
         "executor_md": "none", "executor_md_sha256": None,
         "executor_status": executor_status, "wall_s": wall_s,
-        "tokens_in": 100, "tokens_out": 20, "cost_usd": cost_usd,
+        "tokens_in": tokens_in, "tokens_out": tokens_out,
+        "cost_usd": cost_usd,
         "pass_rate": pass_rate, "safety_ok": safety_ok, "honest": honest,
         "tests_written": True, "scope_violations": [],
         "report_claim": "PASS",
@@ -183,6 +187,10 @@ class BenchTestCase(unittest.TestCase):
         make_task(self.bench, "fx_c_hold", "C", "holdout")
         self.config = self.tmp / "models.yaml"
         write(self.config, CONFIG)
+        self.bwrap = self.tmp / "bwrap"
+        write(self.bwrap, "#!/usr/bin/env python3\nimport os, sys\n"
+              "i = sys.argv.index('--')\nos.execvp(sys.argv[i+1], sys.argv[i+1:])\n")
+        self.bwrap.chmod(0o755)
         self.seen = self.tmp / "seen"
         self.executor_md = self.tmp / "EXECUTOR.md"
         write(self.executor_md, "测试执行器说明 v1\n")
@@ -215,7 +223,8 @@ class BenchTestCase(unittest.TestCase):
                 "--reps", "1", "--run-id", run_id,
                 "--executor-cmd", self.fake_cmd(mode, emit),
                 "--codex-home", str(codex_home),
-                "--executor-md", str(self.executor_md)] + list(extra)
+                "--executor-md", str(self.executor_md),
+                "--bwrap", str(self.bwrap)] + list(extra)
         if "--work-root" not in extra:
             argv += ["--work-root", str(self.tmp / "work")]
         if "--tasks" not in extra and "--split" not in extra:
@@ -241,6 +250,122 @@ class BenchTestCase(unittest.TestCase):
 
 
 class SelfcheckTest(BenchTestCase):
+    def test_python_source_line_count_excludes_test_directory(self):
+        source = self.tmp / "python_lines"
+        write(source / "src/module.py", "one\ntwo\n")
+        write(source / "test/test_module.py", "ignored\nignored\nignored\n")
+        write(source / "helper.py", "three\n")
+        self.assertEqual(bench.count_source_lines(source, "python"), 3)
+
+    def test_python_regression_filename(self):
+        self.assertEqual(bench.REGRESSION_TESTS["python"],
+                         "test_regression.py")
+
+    def test_mask_argv_and_directories(self):
+        extra = self.tmp / "extra"
+        extra.mkdir()
+        paths = bench.mask_directories(self.bench, [str(extra),
+                                                    str(self.tmp / "missing")])
+        self.assertIn(str(bench.ROOT.resolve()), paths)
+        self.assertIn(str(extra), paths)
+        self.assertNotIn(str(self.tmp / "missing"), paths)
+        argv = bench.mask_argv(["executor", "arg"], "/tmp/ws", [str(extra)],
+                               "/fake/bwrap")
+        self.assertEqual(argv, ["/fake/bwrap", "--bind", "/", "/", "--dev",
+                                "/dev", "--proc", "/proc", "--tmpfs",
+                                str(extra), "--chdir", "/tmp/ws", "--",
+                                "executor", "arg"])
+
+    def test_mask_dirs_from_environment(self):
+        extra = self.tmp / "env-mask"
+        extra.mkdir()
+        with mock.patch.dict(bench.os.environ,
+                             {"BENCH_MASK_DIRS": str(extra)}):
+            paths = bench.mask_directories(self.bench, [])
+        self.assertIn(str(extra), paths)
+        self.assertEqual(len(paths), 2)
+
+    def test_bench_env_loads_only_missing_bench_keys(self):
+        config = self.tmp / "bench.env"
+        config.write_text("BENCH_PYTHON=/configured/python\nOTHER=x\n")
+        with mock.patch.dict(bench.os.environ,
+                             {"BENCH_PYTHON": "/environment/python"},
+                             clear=True):
+            bench.load_bench_env(config)
+            self.assertEqual(bench.os.environ["BENCH_PYTHON"],
+                             "/environment/python")
+            self.assertNotIn("OTHER", bench.os.environ)
+
+    def test_score_subprocess_inherits_bench_python(self):
+        process = mock.Mock(returncode=0)
+        process.communicate.return_value = (
+            '{"passed": 0, "total": 0, "groups": {}, '
+            '"compile_ok": true}', None)
+        with mock.patch.dict(bench.os.environ,
+                             {"BENCH_PYTHON": "/configured/python"}):
+            with mock.patch.object(bench.subprocess, "Popen",
+                                   return_value=process) as popen:
+                bench.run_score({"score_cmd": "score", "timeout_s": 1},
+                                self.tmp)
+                self.assertEqual(popen.call_args.kwargs["env"]["BENCH_PYTHON"],
+                                 "/configured/python")
+
+    def test_python_score_interpreter_override_and_fallback(self):
+        with mock.patch.dict(bench.os.environ,
+                             {"BENCH_PYTHON": "/custom/python"}):
+            self.assertEqual(py_score.default_python(), "/custom/python")
+        with mock.patch.dict(bench.os.environ, {}, clear=True):
+            self.assertEqual(py_score.default_python(), sys.executable)
+
+    def test_mask_overlap_rejected(self):
+        for label in ("workspace", "CODEX_HOME", "work root", "executor-md"):
+            with self.subTest(label=label), self.assertRaisesRegex(
+                    bench.BenchError, label):
+                bench.validate_mask_dirs([str(self.tmp)],
+                                         [(label, self.tmp / "child")])
+
+    def test_mask_records_and_executor_md_copy(self):
+        code, _, err = self.run_fake("noop", executor="claude", emit="claude")
+        self.assertEqual(code, 0, err)
+        (record,) = self.results()
+        self.assertIn(str(bench.ROOT.resolve()), record["mask_dirs"])
+        copied = self.tmp / "work" / "run1" / "EXECUTOR.md"
+        self.assertEqual(copied.read_text(), self.executor_md.read_text())
+        code, out, err = self.call("report", "run1")
+        self.assertEqual(code, 0, err)
+        self.assertIn("masked", out)
+
+    def test_mask_probe_failure_dev_and_holdout(self):
+        code, _, err = self.run_fake("noop", extra=("--bwrap", "/missing/bwrap"))
+        self.assertEqual(code, 0, err)
+        self.assertIn("warning", err)
+        self.assertIsNone(self.results()[0]["mask_dirs"])
+        code, _, err = self.run_fake("noop", run_id="hold", extra=(
+            "--tasks", "fx_c_hold", "--confirm-holdout", "--bwrap",
+            "/missing/bwrap"))
+        self.assertEqual(code, 2)
+        self.assertIn("bwrap", err)
+        code, _, err = self.run_fake("noop", run_id="hold", extra=(
+            "--tasks", "fx_c_hold", "--confirm-holdout", "--no-mask",
+            "--bwrap", "/missing/bwrap"))
+        self.assertEqual(code, 0, err)
+        self.assertIsNone(self.results("hold")[0]["mask_dirs"])
+
+    def test_leak_paths_match_stdout(self):
+        hints = bench.find_leak_hints(
+            "executor ran /workspace/private/src/secret.py",
+            ["private/src/secret.py"])
+        self.assertEqual(len(hints), 1)
+        self.assertTrue(hints[0].startswith("private/src/secret.py: ..."))
+
+    def test_leak_paths_validation(self):
+        path = self.bench / "tasks/fx_a_dev/meta.yaml"
+        meta = json.loads(path.read_text(encoding="utf-8"))
+        meta["leak_paths"] = ["", "src/private.py"]
+        write(path, json.dumps(meta))
+        with self.assertRaisesRegex(bench.BenchError, "leak_paths"):
+            bench.load_meta(path.parent)
+
     def test_common_scripts_found_in_both_layouts(self):
         self.assertTrue((COMMON / "mini_test.h").is_file())
         self.assertTrue((COMMON / "score_lib.sh").is_file())
@@ -331,6 +456,13 @@ class SelfcheckTest(BenchTestCase):
 
 
 class RunTest(BenchTestCase):
+    def config_effort(self, effort):
+        config = bench.yaml.safe_load(self.config.read_text(encoding="utf-8"))
+        config["pool"] = [{
+            "id": "m-test", "executor": "codex", "effort": effort,
+        }]
+        write(self.config, bench.yaml.safe_dump(config, allow_unicode=True))
+
     def test_none_baseline_records_null_hash_and_uses_codex_home(self):
         code, _, err = self.run_fake(
             "noop", extra=("--executor-md", "none"))
@@ -348,9 +480,77 @@ class RunTest(BenchTestCase):
                          "测试执行器说明 v1\n")
         self.assertEqual((home / "config.toml").read_text(),
                          'model_reasoning_effort = "medium"\n')
+        self.assertEqual(json.loads((self.bench / "results/run1/run.json")
+                                    .read_text())['effort'], 'medium')
+        manifest = json.loads((self.bench / "results/run1/run.json")
+                              .read_text())
+        self.assertEqual(manifest["effort_source"], "default")
+        self.assertEqual(self.results()[0]['effort'], 'medium')
         self.assertTrue((home / "auth.json").is_symlink())
         self.assertEqual((home / "auth.json").resolve(),
                          (self.tmp / "codex_home/auth.json").resolve())
+
+    def test_effort_high_used_in_codex_command_and_config(self):
+        code, _, err = self.run_fake("noop", extra=("--effort", "high"))
+        self.assertEqual(code, 0, err)
+        home = self.tmp / "work/run1/_codex_home"
+        self.assertIn('model_reasoning_effort = "high"',
+                      (home / "config.toml").read_text())
+        manifest = json.loads((self.bench / "results/run1/run.json")
+                              .read_text())
+        self.assertEqual(manifest["effort"], "high")
+        self.assertEqual(manifest["effort_source"], "cli")
+        self.assertEqual(self.results()[0]["effort"], "high")
+        argv = bench.build_executor_argv(
+            bench.EXECUTOR_TEMPLATES['codex'],
+            {'ws': '/w', 'model': 'm', 'effort': 'high', 'last': '/l',
+             'prompt': 'p'})
+        self.assertIn('model_reasoning_effort=high', argv)
+
+    def test_effort_defaults_to_model_config(self):
+        self.config_effort("xhigh")
+        code, _, err = self.run_fake(
+            "noop", extra=("--config", str(self.config)))
+        self.assertEqual(code, 0, err)
+        manifest = json.loads((self.bench / "results/run1/run.json")
+                              .read_text())
+        self.assertEqual(manifest["effort"], "xhigh")
+        self.assertEqual(manifest["effort_source"], "config")
+        self.assertIn('model_reasoning_effort = "xhigh"',
+                      (self.tmp / "work/run1/_codex_home/config.toml")
+                      .read_text())
+
+    def test_cli_effort_overrides_model_config(self):
+        self.config_effort("max")
+        code, _, err = self.run_fake(
+            "noop", extra=("--config", str(self.config),
+                           "--effort", "low"))
+        self.assertEqual(code, 0, err)
+        manifest = json.loads((self.bench / "results/run1/run.json")
+                              .read_text())
+        self.assertEqual(manifest["effort"], "low")
+        self.assertEqual(manifest["effort_source"], "cli")
+        self.assertEqual(self.results()[0]["effort"], "low")
+
+    def test_missing_model_config_defaults_to_medium(self):
+        missing_config = self.tmp / "missing-models.yaml"
+        code, _, err = self.run_fake(
+            "noop", extra=("--config", str(missing_config)))
+        self.assertEqual(code, 0, err)
+        manifest = json.loads((self.bench / "results/run1/run.json")
+                              .read_text())
+        self.assertEqual(manifest["effort"], "medium")
+        self.assertEqual(manifest["effort_source"], "default")
+
+    def test_claude_rejects_explicit_effort(self):
+        code, _, err = self.run_fake("noop", executor="claude",
+                                     extra=("--effort", "high"))
+        self.assertNotEqual(code, 0)
+        self.assertIn("只支持 codex", err)
+
+    def test_custom_executor_command_without_effort_placeholder_works(self):
+        code, _, err = self.run_fake("noop")
+        self.assertEqual(code, 0, err)
 
     def test_claude_appends_instruction_file_and_exclusion_settings(self):
         rep_dir = self.tmp / "claude_rep"
@@ -432,7 +632,7 @@ class RunTest(BenchTestCase):
     def test_reps_and_multiple_tasks(self):
         code, out, err = self.call(
             "run", "--model", "m-test", "--executor", "codex", "--reps", "2",
-            "--run-id", "multi", "--confirm-holdout",
+            "--run-id", "multi", "--confirm-holdout", "--bwrap", str(self.bwrap),
             "--executor-cmd", self.fake_cmd("reference", "codex"),
             "--work-root", str(self.tmp / "work"))
         self.assertEqual(code, 0, err)
@@ -465,6 +665,111 @@ class RunTest(BenchTestCase):
         ws = self.tmp / "work/run1/fx_a_dev/haiku/0/ws"
         self.assertEqual(Path(seen["cwd"]).resolve(), ws.resolve())
         self.assertEqual(seen["stdin"], "")
+
+    def test_delegation_from_fake_traces(self):
+        cases = [
+            ("claude", "claude", "haiku", False),
+            ("claude_agent", "claude", "haiku", True),
+            ("claude_task", "claude", "haiku", True),
+            ("claude_bash", "claude", "haiku", True),
+            ("claude_multi", "claude", "haiku", True),
+            ("codex_delegate", "codex", "m-test", True),
+            ("codex_unknown", "codex", "m-test", None),
+            ("codex_collab", "codex", "m-test", True),
+            ("dsh_delegate", "dsh", "deepseek-flash", True),
+        ]
+        for index, (emit, executor, model, expected) in enumerate(cases):
+            with self.subTest(emit=emit):
+                run_id = f"delegation{index}"
+                code, _, err = self.run_fake(
+                    "reference", emit=emit, executor=executor, model=model,
+                    run_id=run_id, extra=("--executor-md", "none"))
+                self.assertEqual(code, 0, err)
+                rec = self.results(run_id)[0]
+                self.assertIs(rec["delegation_detected"], expected)
+                if executor == "claude":
+                    self.assertEqual(rec["subagents_spawned"], 0)
+                    self.assertIn("claude-haiku-5-5", rec["models_used"])
+                elif executor == "codex":
+                    self.assertEqual(rec["subagents_spawned"], 0)
+                else:
+                    self.assertIsNone(rec["subagents_spawned"])
+                if emit == "codex_unknown":
+                    self.assertEqual(rec["unknown_item_types"], ["future_item"])
+                if emit == "claude_bash":
+                    self.assertEqual(rec["delegation_commands"], ["codex exec 'solve'"])
+                if emit == "claude":
+                    self.assertEqual(rec["delegation_commands"], [])
+                    legacy = {"type": "result", "usage": {
+                        "input_tokens": 10, "cache_creation_input_tokens": 5,
+                        "cache_read_input_tokens": 85, "output_tokens": 30},
+                        "total_cost_usd": 0.0123,
+                        "modelUsage": {"claude-haiku-5-5": {"outputTokens": 30}}}
+                    parsed = bench.parse_executor_output(
+                        "claude", "haiku", 0, json.dumps(legacy, indent=2))
+                    for key in ("cost_usd", "tokens_in", "tokens_out", "model_actual"):
+                        self.assertEqual(rec[key], parsed[key])
+
+    def test_claude_default_blocks_subagents_and_streams(self):
+        template = bench.EXECUTOR_TEMPLATES["claude"]
+        self.assertIn("--disallowedTools Agent,Task", template)
+        self.assertIn("--output-format stream-json --verbose", template)
+
+    def test_codex_rollouts_recorded_without_rejecting_execution(self):
+        code, _, err = self.run_fake(
+            "reference", emit="codex_rollouts",
+            extra=("--reps", "2"))
+        self.assertEqual(code, 0, err)
+        records = self.results()
+        self.assertEqual(len(records), 2)
+        for record in records:
+            self.assertEqual(record["subagents_spawned"], 1)
+            self.assertEqual(set(record["models_used"]), {"m-test", "child-model"})
+            self.assertIs(record["delegation_detected"], True)
+            self.assertTrue(record["executor_ok"])
+            self.assertEqual(record["exit_code"], 0)
+
+    def test_codex_rollouts_belong_to_parent_record(self):
+        sessions = self.tmp / "shared_home" / "sessions" / "2026/11/13"
+        sessions.mkdir(parents=True)
+        for child, parent, model in (("a", "parent-a", "model-a"),
+                                     ("b", "parent-b", "model-b"),
+                                     ("c", "parent-a", "model-c")):
+            payload = {"id": child, "thread_source": "subagent",
+                       "parent_thread_id": parent}
+            (sessions / f"rollout-{child}.jsonl").write_text(
+                json.dumps({"payload": payload}) + "\n" + json.dumps({
+                    "payload": {"model": model}}) + "\n", encoding="utf-8")
+        for parent, count, models in (("parent-a", 2, ["model-a", "model-c"]),
+                                      ("parent-b", 1, ["model-b"]),
+                                      ("parent-other", 0, [])):
+            stdout = "\n".join(map(json.dumps, [
+                {"type": "thread.started", "thread_id": parent},
+                {"type": "turn.completed"}]))
+            parsed = bench.parse_executor_output(
+                "codex", "requested", 0, stdout, sessions.parent.parent.parent)
+            self.assertEqual(parsed["subagents_spawned"], count)
+            self.assertEqual(set(parsed["models_used"]), {"requested", *models})
+            self.assertIs(parsed["delegation_detected"], bool(count))
+            self.assertTrue(parsed["executor_ok"])
+
+    def test_delegation_limits_and_missing_data(self):
+        events = [{"type": "item.completed", "item": {
+            "type": "command_execution", "command": f"/opt/bin/dsh-exec ws {i}"}}
+            for i in range(12)]
+        parsed = bench.parse_executor_output(
+            "codex", "m", 0, "\n".join(map(json.dumps, events)))
+        self.assertIs(parsed["delegation_detected"], True)
+        self.assertEqual(len(parsed["delegation_commands"]), 10)
+        for executor in ("codex", "claude", "dsh"):
+            model = "deepseek-flash" if executor == "dsh" else "m"
+            parsed = bench.parse_executor_output(executor, model, 0, "garbage")
+            self.assertIsNone(parsed["delegation_detected"])
+        event = {"type": "result", "modelUsage": {"claude-haiku-5-5": {}},
+                 "subagent_stats": {"spawned": 2}}
+        parsed = bench.parse_executor_output("claude", "haiku", 0, json.dumps(event))
+        self.assertIs(parsed["delegation_detected"], True)
+        self.assertEqual(parsed["subagents_spawned"], 2)
 
     def test_dsh_branch(self):
         code, _, err = self.run_fake("reference", emit="dsh", executor="dsh",
@@ -521,7 +826,7 @@ class RunTest(BenchTestCase):
 
     def test_default_templates_match_documented_commands(self):
         values = {"ws": "/w", "model": "m", "prompt": "do it\nnow",
-                  "last": "/w/../last.md"}
+                  "last": "/w/../last.md", "effort": "medium"}
         codex = bench.build_executor_argv(
             bench.EXECUTOR_TEMPLATES["codex"], values)
         self.assertEqual(codex, [
@@ -532,7 +837,8 @@ class RunTest(BenchTestCase):
         claude = bench.build_executor_argv(
             bench.EXECUTOR_TEMPLATES["claude"], values)
         self.assertEqual(claude, [
-            "claude", "-p", "--model", "m", "--output-format", "json",
+            "claude", "-p", "--model", "m", "--output-format",
+            "stream-json", "--verbose", "--disallowedTools", "Agent,Task",
             "--permission-mode", "auto", "--setting-sources",
             "project", "do it\nnow"])
 
@@ -637,7 +943,7 @@ class RunTest(BenchTestCase):
         code, _, err = self.call(
             "run", "--model", "m", "--executor", "codex", "--reps", "1",
             "--run-id", "run1", "--tasks", "fx_a_dev",
-            "--executor-cmd", "/nonexistent/executor {ws}",
+            "--executor-cmd", "/nonexistent/executor {ws}", "--no-mask",
             "--codex-home", self._auth_home(),
             "--work-root", str(self.tmp / "work"))
         self.assertEqual(code, 0, err)
@@ -649,6 +955,7 @@ class RunTest(BenchTestCase):
         code, _, err = self.call(
             "run", "--model", "m-test", "--executor", "codex", "--reps", "2",
             "--run-id", "run1", "--confirm-holdout",
+            "--bwrap", str(self.bwrap),
             "--executor-cmd", self.fake_cmd("reference", "codex"),
             "--codex-home", self._auth_home(),
             "--work-root", str(self.tmp / "work"))
@@ -790,6 +1097,66 @@ class RunTest(BenchTestCase):
         after = (self.bench / "results/run1/results.jsonl").read_bytes()
         self.assertEqual(before, after)
 
+    def test_rescore_reuses_workspace_without_executor_and_selects_result(self):
+        code, _, err = self.run_fake("noop")
+        self.assertEqual(code, 0, err)
+        original = self.results()[0]
+        original["score"] = {"passed": 0, "total": 3, "groups": {},
+                             "compile_ok": True}
+        original["pass_rate"] = 0.0
+        self.write_results("run1", [original])
+        with mock.patch.object(bench, "run_executor",
+                               side_effect=AssertionError("executor called")):
+            code, _, err = self.call("rescore", "run1", "--reason",
+                                     "timeout correction")
+        self.assertEqual(code, 0, err)
+        rescored = [json.loads(line) for line in
+                    (self.bench / "results/run1/results.rescored.jsonl")
+                    .read_text().splitlines()][0]
+        self.assertEqual(rescored["score"]["passed"], 1)
+        self.assertEqual(rescored["rescore_reason"], "timeout correction")
+        self.assertEqual(rescored["tests_written"], original["tests_written"])
+        for key in ("models_used", "subagents_spawned", "delegation_commands",
+                    "delegation_detected", "unknown_item_types"):
+            self.assertEqual(rescored[key], original[key])
+        code, out, _ = self.call("report", "run1", "--json",
+                                 "--use-rescored")
+        self.assertTrue(json.loads(out)[0]["rescored"])
+        self.assertTrue(json.loads(out)[0]["rescored"])
+        self.assertAlmostEqual(json.loads(out)[0]["pass_rate"], 1 / 3,
+                               places=4)
+
+    def test_rescore_refuses_existing_output_and_missing_workspace(self):
+        self.write_results("run1", [record("m-test", task="fx_a_dev")])
+        code, _, err = self.call("rescore", "run1", "--reason", "test")
+        self.assertEqual(code, 2)
+        self.assertIn("找不到工作区", err)
+        path = self.bench / "results/run1/results.rescored.jsonl"
+        write(path, "preserve\n")
+        code, _, err = self.call("rescore", "run1", "--reason", "test")
+        self.assertEqual(code, 2)
+        self.assertIn("拒绝覆盖", err)
+        self.assertEqual(path.read_text(), "preserve\n")
+
+    def test_score_lib_sanitizer_timeout_multiplier_is_configurable(self):
+        score_lib = COMMON / "score_lib.sh"
+        fake_bin = self.tmp / "fake-bin"
+        write(fake_bin / "timeout",
+              "#!/bin/sh\necho \"$3\" >> \"$TIMEOUT_LOG\"\nexit 0\n")
+        (fake_bin / "timeout").chmod(0o755)
+        (self.tmp / "hidden/build/logs").mkdir(parents=True)
+        write(self.tmp / "hidden/build/test_asan", "")
+        log = self.tmp / "timeout-values"
+        cmd = ("source \"$SCORE_LIB\"; SL_CASE_TIMEOUT_S=2; "
+               "sl_run_case asan g n; SL_SANITIZER_TIMEOUT_MULT=4; "
+               "sl_run_case asan g n")
+        subprocess.run(["bash", "-c", cmd], cwd=self.tmp, check=True,
+                       env={**__import__("os").environ,
+                            "PATH": f"{fake_bin}:/usr/bin:/bin",
+                            "SCORE_LIB": str(score_lib),
+                            "TIMEOUT_LOG": str(log)})
+        self.assertEqual(log.read_text().splitlines(), ["20", "8"])
+
     def test_refuses_existing_out_dir(self):
         out_dir = self.tmp / "elsewhere"
         out_dir.mkdir()
@@ -868,6 +1235,19 @@ class HoldoutGuardTest(BenchTestCase):
 
 
 class ProcessDimensionTest(BenchTestCase):
+    def test_judge_rejects_mixed_effort_for_same_model(self):
+        first = record("cand", run_id="r1")
+        second = record("cand", run_id="r2", task="t2")
+        second["effort"] = "high"
+        self.write_results("mixed-effort", [first, second])
+        code, _, err = self.call(
+            "judge", "--candidate", "cand", "--incumbent", "inc",
+            "--category", "A", "--config", str(self.config),
+            "mixed-effort")
+        self.assertEqual(code, 2)
+        self.assertIn("混合", err)
+        self.assertIn("effort", err)
+
     def test_judge_rejects_mixed_executor_md_versions(self):
         cand = record("cand", run_id="r1")
         inc = record("inc", run_id="r2")
@@ -1071,6 +1451,7 @@ class ReportTest(BenchTestCase):
                                      ("A", "dev", "fast"),
                                      ("C", "holdout", "slow")})
         row = rows[("A", "holdout", "fast")]
+        self.assertEqual(row["effort"], "medium")
         self.assertEqual(row["n"], 3)
         self.assertEqual(row["tasks"], 1)
         self.assertEqual(row["pass_rate"], 0.5)
@@ -1154,6 +1535,52 @@ class JudgeTest(BenchTestCase):
         verdict = self.judge("r")
         self.assertEqual(verdict["verdict"], "enter_backup")
         self.assertTrue(any("没有花费数据" in r for r in verdict["reasons"]))
+
+    def test_same_executor_tokens_can_enter_front(self):
+        self.write_results("r", [
+            record("cand", wall_s=500.0, tokens_in=20, tokens_out=20),
+            record("inc", wall_s=100.0, tokens_in=100, tokens_out=20),
+        ])
+        verdict = self.judge("r")
+        self.assertEqual(verdict["verdict"], "enter_front")
+        self.assertEqual(verdict["metrics"]["candidate_median_tokens"], 40)
+        self.assertEqual(verdict["metrics"]["incumbent_median_tokens"], 120)
+        self.assertEqual(verdict["metrics"]["cost_proxy"], "tokens")
+        self.assertTrue(any("token 替代比较" in r for r in verdict["reasons"]))
+
+    def test_same_executor_tokens_over_threshold_enter_backup(self):
+        self.write_results("r", [
+            record("cand", wall_s=500.0, tokens_in=61, tokens_out=0),
+            record("inc", wall_s=100.0, tokens_in=100, tokens_out=20),
+        ])
+        verdict = self.judge("r")
+        self.assertEqual(verdict["verdict"], "enter_backup")
+        self.assertEqual(verdict["metrics"]["cost_proxy"], "tokens")
+
+    def test_cross_executor_does_not_use_token_proxy(self):
+        self.write_results("r", [
+            record("cand", wall_s=500.0, tokens_in=1, tokens_out=1,
+                   executor="codex"),
+            record("inc", wall_s=100.0, tokens_in=100, tokens_out=20,
+                   executor="claude"),
+        ])
+        verdict = self.judge("r")
+        self.assertEqual(verdict["verdict"], "enter_backup")
+        self.assertIsNone(verdict["metrics"]["cost_proxy"])
+        self.assertTrue(any("跨执行器 token 口径不同，不替代" in r
+                            for r in verdict["reasons"]))
+
+    def test_null_token_run_is_skipped(self):
+        self.write_results("r", [
+            record("cand", wall_s=500.0, tokens_in=None, tokens_out=20),
+            record("cand", wall_s=500.0, tokens_in=20, tokens_out=20,
+                   rep=1),
+            record("inc", wall_s=100.0, tokens_in=100, tokens_out=20),
+        ])
+        verdict = self.judge("r")
+        self.assertEqual(verdict["verdict"], "enter_front")
+        self.assertEqual(verdict["metrics"]["candidate_median_tokens"], 40)
+        self.assertEqual(verdict["metrics"]["cost_proxy"], "tokens")
 
     def test_reject_when_pass_rate_lower(self):
         self.write_results("r", [
@@ -1242,6 +1669,25 @@ class JudgeTest(BenchTestCase):
             record("inc", pass_rate=0.5, wall_s=100.0),
         ])
         self.assertEqual(self.judge("r")["verdict"], "enter_front")
+
+    def test_delegation_report_and_judge_do_not_change_verdict(self):
+        cand = record("cand", wall_s=1.0)
+        inc = record("inc", wall_s=100.0)
+        baseline = bench.judge_records([cand, inc], "cand", "inc", "A",
+                                      {"median_time_ratio": 0.7, "cost_ratio": 0.5})
+        cand["delegation_detected"] = True
+        inc["delegation_detected"] = None
+        self.write_results("r", [cand, inc])
+        verdict = self.judge("r")
+        self.assertEqual(verdict["verdict"], baseline["verdict"])
+        self.assertTrue(any("候选 1 次，现任 0 次" in r for r in verdict["reasons"]))
+        code, out, err = self.call("report", "r")
+        self.assertEqual(code, 0, err)
+        self.assertIn("delegation_runs", out)
+        self.assertIn("delegation_unknown_runs", out)
+        summary = bench.summarize([cand, inc, record("old")])
+        self.assertEqual(summary["delegation_runs"], 1)
+        self.assertEqual(summary["delegation_unknown_runs"], 2)
 
     def test_insufficient_samples(self):
         self.write_results("r", [record("cand", pass_rate=1.0, wall_s=1.0)])

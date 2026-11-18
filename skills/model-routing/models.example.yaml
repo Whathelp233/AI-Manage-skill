@@ -1,34 +1,78 @@
 pool:
-  - id: gpt-6-luna
-    executor: codex
-    status: active
-    evaluated: true
-    note: ""
-  - id: gpt-6.1-sol
-    executor: codex
-    status: active
-    evaluated: true
-    note: ""
-  - id: gpt-6-astra
-    executor: codex
-    status: retired
-    evaluated: false
-    note: 用户 2026-11-13 移出池，不评测
-  - id: claude-haiku-5-5
-    alias: haiku
-    executor: claude
-    status: candidate
-    evaluated: false
-    note: ""
-  - id: deepseek-flash
-    executor: dsh
-    status: active
-    evaluated: false
-    note: 兜底，不参与路由
+- id: gpt-6-luna
+  executor: codex
+  status: active
+  evaluated: true
+  effort: max
+  note: ''
+- id: gpt-6.1-sol
+  executor: codex
+  status: active
+  evaluated: true
+  effort: high
+  note: ''
+- id: gpt-6-astra
+  executor: codex
+  status: retired
+  evaluated: false
+  note: ''
+- id: gpt-6.1-terra
+  executor: codex
+  status: active
+  evaluated: true
+  effort: high
+  note: ''
+- id: gpt-6.2-sol
+  executor: codex
+  status: candidate
+  evaluated: false
+  effort: high
+  note: ''
+- id: claude-haiku-5-5
+  alias: haiku
+  executor: claude
+  status: active
+  evaluated: true
+  note: ''
+- id: deepseek-flash
+  executor: dsh
+  status: active
+  evaluated: false
+  note: ''
+- id: gpt-6-sol
+  executor: codex
+  status: retired
+  evaluated: false
+  note: ''
+- id: gpt-5.6-luna
+  executor: codex
+  status: retired
+  evaluated: false
+  note: ''
+- id: gpt-5.6-sol
+  executor: codex
+  status: retired
+  evaluated: false
+  note: ''
+- id: gpt-5.6-terra
+  executor: codex
+  status: retired
+  evaluated: false
+  note: ''
 routing:
-  A: [gpt-6-luna, gpt-6.1-sol]
-  B: [gpt-6.1-sol]
-  C: [gpt-6.1-sol]
+  A:
+  - gpt-6-luna
+  - gpt-6.1-terra
+  - claude-haiku-5-5
+  - gpt-6.1-sol
+  B:
+  - gpt-6.1-terra
+  - gpt-6.1-sol
+  - claude-haiku-5-5
+  C:
+  - gpt-6.1-terra
+  - gpt-6.1-sol
+  - claude-haiku-5-5
 rework:
   same_defect_rounds: 2
   total_rounds: 3
@@ -37,6 +81,6 @@ thresholds:
   cost_ratio: 0.5
   reeval_min_records: 8
   reeval_window: 20
-  reeval_rate: 0.30
+  reeval_rate: 0.3
   rework_records_min: 20
   rework_rescue_rate: 0.15

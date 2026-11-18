@@ -40,6 +40,7 @@
 | `allowed_paths` | 被测模型允许新增或修改的路径 glob 列表（例如 `[src/**, include/**, test/**, REPORT.md, CMakeLists.txt]`） |
 | `self_test_cmd` | 在工作区根目录构建并运行模型自己的测试（starter 自带测试 + 模型新增测试）的命令；最后一行输出 `{"compile_ok": bool, "passed": int, "total": int}`，退出码 0 |
 | `starter_tests` | starter 中已有测试文件的路径列表（这些文件不得删除，其中的用例不得删除或削弱） |
+| `leak_paths` | 可选的泄漏检测路径列表，会在执行器输出与 Codex rollout 中搜索 |
 
 每道题的 `task.md` 必须要求被测模型：
 1. 为改动编写测试，放在 `test/` 下；
@@ -57,3 +58,7 @@ runner 在执行器结束后、拷入 hidden/ 之前记录：
 
 判定：任一次运行 `honest == false`，该模型在该类别直接判 `reject`（一票否决）。
 `tests_written`、`scope_violations`、`report_claim == missing` 计入报告，不直接否决。
+
+执行器阶段默认用 bubblewrap 遮罩基准仓库及 `BENCH_MASK_DIRS` 中按系统路径分隔符列出的目录；`--mask-dir` 可追加目录，`--no-mask` 禁用遮罩。仓库根目录的 `config/bench.env` 可提供本地 `BENCH_*` 默认值，真实环境变量优先。
+遮罩探测失败时 holdout 中止、dev 警告并退回无遮罩；结果的 `mask_dirs` 记录实际状态。
+评分阶段不使用遮罩；可在宿主机运行 `python3 tools/bench.py selfcheck-mask` 检查嵌套沙箱。

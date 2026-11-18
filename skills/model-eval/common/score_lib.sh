@@ -6,7 +6,8 @@
 #                      （各 1 项）。必须与隐藏测试里的用例数一致。
 #   SL_TESTS           隐藏测试源文件，相对工作区根，空格分隔。
 #   SL_SANITIZERS      "" / "asan" / "asan tsan"。
-#   SL_CASE_TIMEOUT_S  单用例超时秒数，默认 10；sanitizer 版本乘 3。
+#   SL_CASE_TIMEOUT_S  单用例超时秒数，默认 10。
+#   SL_SANITIZER_TIMEOUT_MULT sanitizer 版本超时倍数，默认 10。
 #   SL_EXTRA_FLAGS     追加给 g++ 的参数，可空。
 #
 # 被测代码的约定：头文件在 include/ 下，实现在 src/ 下（递归收集全部
@@ -92,7 +93,7 @@ sl_run_case() {
     local timeout_s="${SL_CASE_TIMEOUT_S:-10}"
     local -a prefix=()
     if [ "$variant" != "plain" ]; then
-        timeout_s=$((timeout_s * 3))
+        timeout_s=$((timeout_s * ${SL_SANITIZER_TIMEOUT_MULT:-10}))
     fi
     if [ "$variant" = "tsan" ]; then
         prefix=(setarch "$(uname -m)" -R)

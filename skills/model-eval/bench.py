@@ -42,6 +42,20 @@ DEFAULT_CONFIG = (ROOT / "config" / "models.yaml" if SOURCE_LAYOUT else
                   ROOT.parent / "model-routing" / "config" / "models.yaml")
 DEFAULT_EXECUTOR_MD = (ROOT / "executor" / "EXECUTOR.md" if SOURCE_LAYOUT
                        else ROOT.parent / "executor-dispatch" / "EXECUTOR.md")
+
+
+def load_bench_env(path=None):
+    """Load repository-local BENCH_* defaults without overriding the shell."""
+    path = Path(path) if path else ROOT / "config" / "bench.env"
+    if not path.is_file():
+        return
+    for line in path.read_text(encoding="utf-8").splitlines():
+        line = line.strip()
+        if not line or line.startswith("#"):
+            continue
+        key, separator, value = line.partition("=")
+        if separator and key.startswith("BENCH_"):
+            os.environ.setdefault(key, value)
 META_FIELDS = ("id", "category", "split", "language", "score_cmd",
                "timeout_s", "total_checks", "groups", "summary",
                "allowed_paths", "self_test_cmd", "starter_tests")
@@ -49,6 +63,7 @@ CATEGORIES = ("A", "B", "C")
 SPLITS = ("dev", "holdout")
 LANGUAGES = ("cpp", "python")
 EXECUTORS = ("codex", "claude", "dsh")
+EFFORTS = ("low", "medium", "high", "xhigh", "max", "ultra")
 # 被测模型的工作区里绝不能出现的东西。
 FORBIDDEN_IN_WORKSPACE = ("hidden", "reference", "TASKS.md", "meta.yaml")
 # C 类题必须有的分组。
@@ -61,6 +76,9 @@ TEST_DIR = "test"
 TEST_SUFFIXES = (".cpp", ".cc", ".h", ".hpp", ".py")
 STARTER_MAX_RATIO = 0.5
 B_STARTER_MIN_LINES = 800
+# B 类 regression 用例所在的隐藏测试文件（按语言）。
+REGRESSION_TESTS = {"cpp": "test_regression.cpp",
+                    "python": "test_regression.py"}
 REPORT_CLAIMS = ("PASS", "FAIL", "NOT_RUN")
 REPORT_LINE = re.compile(r"^TESTS: (PASS|FAIL|NOT_RUN)$")
 DSH_MODEL_ID = "deepseek-flash"
@@ -70,9 +88,10 @@ DSH_MODEL_ID = "deepseek-flash"
 # 的输出文件（在工作区外），{task} 题目 id，{rep} 第几次。
 EXECUTOR_TEMPLATES = {
     "codex": ("codex exec -C {ws} -m {model} "
-              "-c model_reasoning_effort=\"medium\" -s workspace-write "
+              "-c model_reasoning_effort=\"{effort}\" -s workspace-write "
               "--skip-git-repo-check --json -o {last} {prompt}"),
-    "claude": ("claude -p --model {model} --output-format json "
+    "claude": ("claude -p --model {model} --output-format stream-json --verbose "
+              "--disallowedTools Agent,Task "
               "--permission-mode auto --setting-sources project {prompt}"),
     "dsh": "~/.local/bin/dsh-exec {ws} --json -",
 }
@@ -114,7 +133,7 @@ def load_meta(task_dir):
     if not isinstance(meta, dict):
         raise BenchError(f"{name}: meta.yaml 必须是映射")
     missing = [k for k in META_FIELDS if k not in meta]
-    extra = [k for k in meta if k not in META_FIELDS]
+    extra = [k for k in meta if k not in META_FIELDS + ("leak_paths",)]
     if missing or extra:
         raise BenchError(
             f"{name}: meta.yaml 字段不符（缺 {missing}，多 {extra}）")
@@ -138,6 +157,11 @@ def load_meta(task_dir):
         raise BenchError(f"{name}: allowed_paths 必须是非空的 glob 列表")
     if not _is_str_list(meta["starter_tests"], allow_empty=True):
         raise BenchError(f"{name}: starter_tests 必须是路径列表")
+    if ("leak_paths" in meta
+            and (not isinstance(meta["leak_paths"], list)
+                 or any(not isinstance(x, str) or not x
+                        for x in meta["leak_paths"]))):
+        raise BenchError(f"{name}: leak_paths 必须是非空字符串列表")
     return meta
 
 
@@ -506,16 +530,21 @@ def compute_process(task_dir, meta, bench_dir, workspace, scratch,
 
 # --------------------------------------------------------------- selfcheck
 
-def count_source_lines(root):
+def count_source_lines(root, language="cpp"):
+    """C++ 数 include/ 与 src/ 下的 .h/.cpp；Python 数 test/ 以外的 .py。"""
+    root = Path(root)
+    if language == "python":
+        paths = [p for p in root.rglob("*.py")
+                 if TEST_DIR not in p.relative_to(root).parts[:1]]
+    else:
+        paths = [p for sub in ("include", "src") if (root / sub).is_dir()
+                 for p in (root / sub).rglob("*")
+                 if p.suffix in (".h", ".cpp")]
     total = 0
-    for sub in ("include", "src"):
-        base = Path(root) / sub
-        if not base.is_dir():
-            continue
-        for path in base.rglob("*"):
-            if path.suffix in (".h", ".cpp") and path.is_file():
-                with open(path, encoding="utf-8", errors="replace") as f:
-                    total += sum(1 for _ in f)
+    for path in paths:
+        if path.is_file():
+            with open(path, encoding="utf-8", errors="replace") as f:
+                total += sum(1 for _ in f)
     return total
 
 
@@ -665,7 +694,7 @@ def selfcheck_task(task_dir, bench_dir, tmp_root, repeat):
                     problems.append(f"{name} 规范检查未全过: {bad}")
 
         if meta["category"] == "B":
-            lines = count_source_lines(task_dir / "starter")
+            lines = count_source_lines(task_dir / "starter", meta["language"])
             info["starter_lines"] = lines
             if lines < B_STARTER_MIN_LINES:
                 problems.append(
@@ -673,15 +702,16 @@ def selfcheck_task(task_dir, bench_dir, tmp_root, repeat):
                     f"{B_STARTER_MIN_LINES}）")
             if "regression" not in meta["groups"]:
                 problems.append("B 类必须有 regression 组")
-            regression = task_dir / "hidden" / "test_regression.cpp"
+            regression_name = REGRESSION_TESTS[meta["language"]]
+            regression = task_dir / "hidden" / regression_name
             if not regression.is_file():
-                problems.append("B 类必须有 hidden/test_regression.cpp")
+                problems.append(f"B 类必须有 hidden/{regression_name}")
             else:
                 # regression 用例只依赖旧接口，在 starter 上必须全过。
                 ws = work / "starter_regression"
                 score, out, err = score_tree(
                     task_dir, meta, bench_dir, task_dir / "starter", ws,
-                    {"BENCH_ONLY_TESTS": "hidden/test_regression.cpp"})
+                    {"BENCH_ONLY_TESTS": f"hidden/{regression_name}"})
                 if err:
                     problems.append(f"starter regression 评分出错: {err}")
                 else:
@@ -818,7 +848,157 @@ def sum_event_usage(events, event_types):
     return tokens_in, tokens_out
 
 
-def parse_executor_output(executor, model, exit_code, stdout):
+# 独立命令词匹配；下划线、点、连字符仍属于文件名的一部分。
+MODEL_CLI_PATTERN = re.compile(
+    r"(?<![\w.-])(?:codex|claude|dsh-exec|deepseek)(?![\w.-])")
+CODEX_ITEM_TYPES = {"command_execution", "file_change", "agent_message",
+                    "reasoning", "todo_list", "web_search"}
+
+
+def model_matches(actual, requested):
+    """支持 Claude CLI 的模型别名，完整 ID 则精确比较。"""
+    return (actual == requested or
+            requested in ("haiku", "sonnet", "opus")
+            and actual.startswith(f"claude-{requested}-"))
+
+
+def codex_subagents(sessions, parent_ids):
+    """Count only rollouts belonging to this record, even in a shared home."""
+    children = {}
+    for path in Path(sessions).rglob("rollout-*.jsonl"):
+        try:
+            with path.open(encoding="utf-8", errors="replace") as stream:
+                payload = json.loads(stream.readline()).get("payload", {})
+                if (payload.get("thread_source") != "subagent"
+                        or payload.get("parent_thread_id") not in parent_ids):
+                    continue
+                child_id = payload.get("id")
+                if not child_id:
+                    continue
+                models = set()
+                for line in stream:
+                    try:
+                        event = json.loads(line)
+                    except ValueError:
+                        continue
+                    def collect(value):
+                        if isinstance(value, dict):
+                            if isinstance(value.get("model"), str):
+                                models.add(value["model"])
+                            for child in value.values():
+                                collect(child)
+                        elif isinstance(value, list):
+                            for child in value:
+                                collect(child)
+                    collect(event)
+                children.setdefault(child_id, set()).update(models)
+        except (OSError, ValueError, AttributeError):
+            continue
+    return children
+
+
+def detect_delegation(executor, model, stdout, codex_sessions=None):
+    """从执行器轨迹收集转派证据；缺少完整轨迹时保留未知状态。"""
+    events = parse_jsonl(stdout)
+    info = {"models_used": [], "subagents_spawned": None,
+            "delegation_commands": [], "delegation_detected": None,
+            "unknown_item_types": []}
+    commands = info["delegation_commands"]
+
+    def add_command(command):
+        if (isinstance(command, str) and MODEL_CLI_PATTERN.search(command)
+                and len(commands) < 10):
+            commands.append(command)
+
+    def scan_arguments(value):
+        if isinstance(value, str):
+            add_command(value)
+        elif isinstance(value, dict):
+            for child in value.values():
+                scan_arguments(child)
+        elif isinstance(value, list):
+            for child in value:
+                scan_arguments(child)
+
+    complete = False
+    agent_tool = False
+    if executor == "claude":
+        result = next((e for e in reversed(events)
+                       if e.get("type") == "result"), {})
+        model_usage = result.get("modelUsage")
+        if isinstance(model_usage, dict):
+            info["models_used"] = list(model_usage)
+        stats = result.get("subagent_stats")
+        if isinstance(stats, dict):
+            spawned = stats.get("spawned")
+            if type(spawned) is int and spawned >= 0:
+                info["subagents_spawned"] = spawned
+        complete = bool(result and info["models_used"])
+        for event in events:
+            if event.get("type") != "assistant":
+                continue
+            message = event.get("message")
+            content = message.get("content", []) if isinstance(message, dict) else []
+            if not isinstance(content, list):
+                continue
+            for block in content:
+                if not isinstance(block, dict) or block.get("type") != "tool_use":
+                    continue
+                if block.get("name") in ("Agent", "Task"):
+                    agent_tool = True
+                if block.get("name") == "Bash":
+                    args = block.get("input")
+                    if isinstance(args, dict):
+                        add_command(args.get("command"))
+    elif executor == "codex":
+        info["models_used"] = [model]
+        complete = any(e.get("type") == "turn.completed" for e in events)
+        for event in events:
+            item = event.get("item")
+            if not isinstance(item, dict):
+                continue
+            kind = item.get("type")
+            if kind == "command_execution":
+                add_command(item.get("command"))
+            elif kind == "collab_tool_call":
+                agent_tool = True
+            elif kind not in CODEX_ITEM_TYPES:
+                if kind not in info["unknown_item_types"]:
+                    info["unknown_item_types"].append(kind)
+        if codex_sessions is not None:
+            parents = {e.get("thread_id") for e in events
+                       if e.get("type") == "thread.started" and e.get("thread_id")}
+            if parents:
+                children = codex_subagents(codex_sessions, parents)
+                info["subagents_spawned"] = len(children)
+                for models in children.values():
+                    for child_model in sorted(models):
+                        if child_model not in info["models_used"]:
+                            info["models_used"].append(child_model)
+    elif executor == "dsh":
+        info["models_used"] = [DSH_MODEL_ID]
+        complete = any(e.get("type") == "status"
+                       and e.get("phase") == "turn_end" for e in events)
+        for event in events:
+            if event.get("type") == "tool_call":
+                for key in ("arguments", "parameters", "params", "input", "args"):
+                    scan_arguments(event.get(key))
+    spawned = info["subagents_spawned"]
+    detected = (agent_tool or spawned is not None and spawned > 0
+                or bool(commands)
+                or any(not model_matches(m, model)
+                       for m in info["models_used"]))
+    if detected:
+        info["delegation_detected"] = True
+    elif complete:
+        info["delegation_detected"] = False
+    if info["unknown_item_types"] and not detected:
+        info["delegation_detected"] = None
+    return info
+
+
+def parse_executor_output(executor, model, exit_code, stdout,
+                          codex_sessions=None):
     """从执行器输出里取 tokens、花费、实际模型、是否成功。解析失败记 None。"""
     info = {"tokens_in": None, "tokens_out": None, "cost_usd": None,
             "model_actual": None, "executor_ok": exit_code == 0}
@@ -829,17 +1009,14 @@ def parse_executor_output(executor, model, exit_code, stdout):
                 events, ("turn.completed",))
             info["model_actual"] = model
         elif executor == "claude":
-            data = None
-            for line in reversed(stdout.splitlines()):
-                line = line.strip()
-                if line.startswith("{"):
-                    try:
-                        data = json.loads(line)
-                        break
-                    except json.JSONDecodeError:
-                        continue
+            events = parse_jsonl(stdout)
+            data = next((e for e in reversed(events)
+                         if e.get("type") == "result"), None)
+            # 兼容历史 --output-format json（包括多行 JSON）。
             if data is None:
-                data = json.loads(stdout)
+                legacy = json.loads(stdout)
+                if isinstance(legacy, dict):
+                    data = legacy
             if isinstance(data, dict):
                 usage = data.get("usage")
                 if isinstance(usage, dict):
@@ -876,16 +1053,33 @@ def parse_executor_output(executor, model, exit_code, stdout):
             info["model_actual"] = DSH_MODEL_ID
     except (ValueError, TypeError, KeyError, AttributeError):
         pass
+    info.update(detect_delegation(executor, model, stdout, codex_sessions))
     return info
 
 
-def find_leak_hints(text):
+def find_leak_hints(text, leak_paths=(), codex_sessions=None):
     """执行器输出里疑似读取评测材料的片段（最多 5 条）。"""
     hints = []
-    for pattern in LEAK_PATTERNS:
-        pos = text.find(pattern)
+    texts = [text]
+    if codex_sessions is not None:
+        parents = {event.get("thread_id") for event in parse_jsonl(text)
+                   if event.get("type") == "thread.started"
+                   and event.get("thread_id")}
+        for path in Path(codex_sessions).rglob("rollout-*.jsonl"):
+            try:
+                with path.open(encoding="utf-8", errors="replace") as stream:
+                    header = json.loads(stream.readline()).get("payload", {})
+                    if header.get("parent_thread_id") in parents:
+                        texts.append(stream.read())
+            except (OSError, ValueError, AttributeError):
+                continue
+    patterns = list(dict.fromkeys((*LEAK_PATTERNS, *leak_paths)))
+    for pattern in patterns:
+        pos = next((text.find(pattern) for text in texts
+                    if text.find(pattern) >= 0), -1)
         if pos >= 0:
-            snippet = text[max(0, pos - 60):pos + 60].replace("\n", " ")
+            source = next(t for t in texts if pattern in t)
+            snippet = source[max(0, pos - 60):pos + 60].replace("\n", " ")
             hints.append(f"{pattern}: ...{snippet}...")
         if len(hints) >= 5:
             break
@@ -902,8 +1096,61 @@ def build_executor_argv(template, values):
     return argv
 
 
+def mask_directories(bench_dir, extra):
+    """确定实际存在的遮罩目录，并规范化路径。"""
+    bench_path = Path(bench_dir).resolve()
+    repo = next((p for p in (bench_path, *bench_path.parents)
+                 if (p / ".git" / "HEAD").is_file() or (p / ".git").is_file()), ROOT)
+    paths = [repo]
+    paths.extend(Path(p).expanduser() for p in
+                 os.environ.get("BENCH_MASK_DIRS", "").split(os.pathsep)
+                 if p)
+    paths.extend(Path(p).expanduser() for p in extra)
+    result = []
+    for path in paths:
+        path = path.resolve()
+        if path.exists():
+            if not path.is_dir():
+                raise BenchError(f"遮罩路径不是目录: {path}")
+            if str(path) not in result:
+                result.append(str(path))
+    ordered = sorted(result, key=lambda p: (len(Path(p).parts), p))
+    selected = []
+    for path in ordered:
+        if not any(Path(path).is_relative_to(parent) for parent in selected):
+            selected.append(path)
+    return selected
+
+
+def validate_mask_dirs(mask_dirs, protected):
+    for mask in mask_dirs:
+        for label, path in protected:
+            if path is not None and Path(path).resolve().is_relative_to(Path(mask)):
+                raise BenchError(f"遮罩目录 {mask} 包含 {label}: {path}")
+
+
+def mask_argv(argv, workspace, mask_dirs, bwrap):
+    if mask_dirs is None:
+        return argv
+    wrapped = [bwrap, "--bind", "/", "/", "--dev", "/dev", "--proc", "/proc"]
+    for path in mask_dirs:
+        wrapped.extend(["--tmpfs", path])
+    return wrapped + ["--chdir", str(workspace), "--"] + argv
+
+
+def probe_mask(mask_dirs, workspace, bwrap):
+    try:
+        proc = subprocess.run(mask_argv(["true"], workspace, mask_dirs, bwrap),
+                              stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                              text=True, timeout=30)
+        return None if proc.returncode == 0 else (proc.stderr.strip() or
+                                                  f"exit {proc.returncode}")
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        return str(exc)
+
+
 def run_executor(executor, template, values, rep_dir, timeout_s, env_extra=None,
-                 executor_md=None):
+                 executor_md=None, leak_paths=(), mask_dirs=None, bwrap="bwrap"):
     """调用执行器，返回记录字段字典。"""
     workspace = values["ws"]
     stdout_name = "dsh.jsonl" if executor == "dsh" else "executor.stdout"
@@ -915,6 +1162,7 @@ def run_executor(executor, template, values, rep_dir, timeout_s, env_extra=None,
             str(Path.home() / ".claude" / "CLAUDE.md")]})
         argv.extend(["--append-system-prompt-file", executor_md,
                      "--settings", settings])
+    argv = mask_argv(argv, workspace, mask_dirs, bwrap)
     result = {"exit_code": None, "executor_status": "ok", "wall_s": None}
     started = time.monotonic()
     try:
@@ -948,14 +1196,20 @@ def run_executor(executor, template, values, rep_dir, timeout_s, env_extra=None,
         stdout = stdout_path.read_text(encoding="utf-8", errors="replace")
     except OSError:
         stdout = ""
+    codex_sessions = None
+    if executor == "codex":
+        home = (env_extra or {}).get("CODEX_HOME", os.environ.get(
+            "CODEX_HOME", "~/.codex"))
+        codex_sessions = Path(home).expanduser() / "sessions"
     parsed = parse_executor_output(executor, values["model"],
-                                   result["exit_code"], stdout)
+                                   result["exit_code"], stdout, codex_sessions)
     if result["executor_status"] != "ok":
         parsed["executor_ok"] = False
     elif not parsed["executor_ok"]:
         result["executor_status"] = "error"
     result.update(parsed)
-    result["leak_hints"] = find_leak_hints(stdout)
+    result["leak_hints"] = find_leak_hints(
+        stdout, leak_paths, codex_sessions)
     return result
 
 
@@ -1026,6 +1280,7 @@ def run_one(task_dir, meta, bench_dir, args, run_id, work_root, rep,
         "split": meta["split"],
         "model": args.model,
         "executor": args.executor,
+        "effort": args.effort,
         "executor_md": args.executor_md_record,
         "executor_md_sha256": args.executor_md_sha256,
         "isolation": (str(work_root / "_codex_home")
@@ -1034,6 +1289,7 @@ def run_one(task_dir, meta, bench_dir, args, run_id, work_root, rep,
                       else str(args.codex_home) if args.executor == "codex"
                       else "setting-sources=project;outside-home"
                       if args.executor == "claude" else None),
+        "mask_dirs": args.mask_dirs_active,
         "rep": rep,
     }
     env_extra = None
@@ -1046,10 +1302,13 @@ def run_one(task_dir, meta, bench_dir, args, run_id, work_root, rep,
         "ws": str(workspace), "model": args.model, "prompt": prompt,
         "prompt_file": str(prompt_file), "last": str(rep_dir / "last.md"),
         "task": meta["id"], "rep": str(rep),
+        "effort": args.effort or "medium",
     }, rep_dir, args.executor_timeout, env_extra=env_extra,
-        executor_md=(str(args.executor_md_path)
+        executor_md=(str(args.executor_md_copy)
                      if args.executor == "claude" and
-                     args.executor_md_path else None)))
+                     args.executor_md_copy else None),
+        leak_paths=meta.get("leak_paths", ()),
+        mask_dirs=args.mask_dirs_active, bwrap=args.bwrap))
 
     # 过程维度在拷入 hidden/ 之前计算。
     process, self_test_log = compute_process(
@@ -1092,8 +1351,51 @@ def compute_safety_ok(category, score):
     return score["compile_ok"] and all(p == t for p, t in safety)
 
 
+def configured_model_effort(config_path, model_id):
+    """Return a Codex model's configured effort, or None when it has none."""
+    try:
+        with open(config_path, encoding="utf-8") as stream:
+            config = yaml.safe_load(stream)
+    except FileNotFoundError:
+        return None
+    except OSError as exc:
+        raise BenchError(f"读不到模型配置 {config_path}: {exc}")
+    except yaml.YAMLError as exc:
+        raise BenchError(f"模型配置 {config_path} 不是合法 YAML: {exc}")
+    if not isinstance(config, dict) or not isinstance(config.get("pool"), list):
+        raise BenchError("模型配置必须包含 pool 列表")
+    selected_effort = None
+    for index, model in enumerate(config["pool"]):
+        if not isinstance(model, dict):
+            raise BenchError(f"pool[{index}] 必须是映射")
+        if "effort" not in model:
+            continue
+        if model.get("executor") != "codex":
+            raise BenchError(f"pool[{index}].effort 只支持 codex")
+        if model["effort"] not in EFFORTS:
+            raise BenchError(f"pool[{index}].effort 不是合法推理强度")
+        if model.get("id") == model_id:
+            selected_effort = model["effort"]
+    return selected_effort
+
+
 def cmd_run(args):
     bench_dir = Path(args.bench_dir)
+    if args.executor != "codex" and args.effort not in (None, "medium"):
+        raise BenchError("--effort 只支持 codex 执行器")
+    if args.executor == "codex":
+        if args.effort is not None:
+            args.effort_source = "cli"
+        else:
+            args.effort = configured_model_effort(args.config, args.model)
+            if args.effort is None:
+                args.effort = "medium"
+                args.effort_source = "default"
+            else:
+                args.effort_source = "config"
+    else:
+        args.effort_source = "cli" if args.effort is not None else "default"
+        args.effort = None
     if args.executor_md == "none":
         args.executor_md_path = None
         args.executor_md_content = None
@@ -1168,19 +1470,42 @@ def cmd_run(args):
         raise BenchError(f"工作目录 {work_root} 已存在，拒绝覆盖")
     template = args.executor_cmd or EXECUTOR_TEMPLATES[args.executor]
 
+    args.executor_md_copy = work_root / "EXECUTOR.md" if args.executor_md_path else None
+    args.mask_dirs_active = None
+    if not args.no_mask:
+        mask_dirs = mask_directories(bench_dir, args.mask_dir)
+        codex_home = (work_root / "_codex_home" if args.executor == "codex"
+                      and args.executor_md_sha256 is not None else args.codex_home)
+        validate_mask_dirs(mask_dirs, [("work root", args.work_root),
+                                      ("codex auth source", args.codex_home if args.executor == "codex" else None),
+                                      ("workspace", work_root),
+                                      ("CODEX_HOME", codex_home),
+                                      ("executor-md copy", args.executor_md_copy)])
+        failure = probe_mask(mask_dirs, tempfile.gettempdir(), args.bwrap)
+        if failure:
+            if holdout:
+                raise BenchError(f"bwrap 遮罩探测失败: {failure}")
+            print(f"warning: bwrap 遮罩探测失败，dev 将不使用遮罩: {failure}",
+                  file=sys.stderr)
+        else:
+            args.mask_dirs_active = mask_dirs
+
     out_dir.mkdir(parents=True)
     work_root.mkdir(parents=True)
+    if args.executor_md_copy:
+        shutil.copyfile(args.executor_md_path, args.executor_md_copy)
     if args.executor == "codex" and args.executor_md_sha256 is not None:
         isolated_home = work_root / "_codex_home"
         isolated_home.mkdir()
         (isolated_home / "config.toml").write_text(
-            'model_reasoning_effort = "medium"\n', encoding="utf-8")
+            f'model_reasoning_effort = "{args.effort}"\n', encoding="utf-8")
         shutil.copyfile(args.executor_md_path, isolated_home / "AGENTS.md")
         auth_target = (args.codex_home / "auth.json").resolve(strict=True)
         (isolated_home / "auth.json").symlink_to(auth_target)
     results_path = out_dir / "results.jsonl"
     manifest = {
         "run_id": run_id, "model": args.model, "executor": args.executor,
+        "effort": args.effort, "effort_source": args.effort_source,
         "reps": args.reps, "tasks": [meta["id"] for _, meta in tasks],
         "executor_cmd": template, "work_root": str(work_root),
         "executor_md": args.executor_md_record,
@@ -1210,6 +1535,89 @@ def cmd_run(args):
     return 0
 
 
+def cmd_selfcheck_mask(args):
+    mask_dirs = mask_directories(args.bench_dir, args.mask_dir)
+    with tempfile.TemporaryDirectory(prefix="bench-mask-", dir=args.work_root) as tmp:
+        workspace = Path(tmp)
+        validate_mask_dirs(mask_dirs, [("workspace", workspace),
+                                      ("CODEX_HOME", Path(os.environ.get(
+                                          "CODEX_HOME", "~/.codex")).expanduser())])
+        failure = probe_mask(mask_dirs, workspace, args.bwrap)
+        if failure:
+            raise BenchError(f"bwrap 遮罩探测失败: {failure}")
+        prompt = ("Run a shell command that writes a file named mask-write-ok in "
+                  "the workspace and writes the output of ls -A ~/agent-router "
+                  "to mask-list.txt in the workspace, and only if ls succeeds create "
+                  "mask-list-ok in the workspace, then reply DONE.")
+        argv = ["codex", "exec", "--skip-git-repo-check", "-m", args.model,
+                "-c", 'model_reasoning_effort="low"', "-s", "workspace-write",
+                prompt]
+        try:
+            proc = subprocess.run(mask_argv(argv, workspace, mask_dirs, args.bwrap),
+                                  cwd=workspace, stdin=subprocess.DEVNULL,
+                                  timeout=300)
+        except OSError as exc:
+            raise BenchError(f"executor 无法启动: {exc}") from exc
+        except subprocess.TimeoutExpired as exc:
+            raise BenchError(f"executor 超时: {exc}") from exc
+        written = (workspace / "mask-write-ok").is_file()
+        listing = workspace / "mask-list.txt"
+        empty = (listing.is_file() and (workspace / "mask-list-ok").is_file()
+                 and not listing.read_text().strip())
+        started = "yes" if proc.returncode == 0 or written or listing.is_file() else "unknown"
+        print(f"executor started: {started} (exit={proc.returncode})")
+        print(f"workspace file created: {'yes' if written else 'no'}")
+        print(f"~/agent-router empty: {'yes' if empty else 'no'}")
+        return 0 if proc.returncode == 0 and written and empty else 1
+
+
+def cmd_rescore(args):
+    results_root = Path(args.results_root or Path(args.bench_dir) / "results")
+    run_dir = results_root / args.run_id
+    source_path = run_dir / "results.jsonl"
+    out_path = run_dir / f"results.{args.out_suffix}.jsonl"
+    if out_path.exists():
+        raise BenchError(f"结果已存在，拒绝覆盖: {out_path}")
+    records = read_results(source_path)
+    rescored = []
+    for index, original in enumerate(records):
+        task_id = original.get("task")
+        task_dir = Path(args.bench_dir) / "tasks" / str(task_id)
+        meta = load_meta(task_dir)
+        workspace_value = original.get("workspace")
+        workspace = Path(workspace_value) if workspace_value else Path()
+        if not workspace_value or not workspace.is_dir():
+            raise BenchError(f"{task_id}: 找不到工作区 {workspace}")
+        score_dir = run_dir / f"rescore-{args.out_suffix}-{index}" / "score"
+        score_dir.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copytree(workspace, score_dir, symlinks=True,
+                        ignore=shutil.ignore_patterns("build", "hidden"))
+        add_hidden(task_dir, args.bench_dir, score_dir)
+        score = run_score(meta, score_dir)[0:3]
+        score_data, score_out, score_error = score
+        style = run_style(score_dir)
+        remove_path(score_dir.parent)
+        updated = dict(original)
+        updated.update({
+            "score": score_data,
+            "score_error": score_error,
+            "pass_rate": (round(score_data["passed"] / score_data["total"], 4)
+                          if score_data and score_data["total"] else
+                          0.0 if score_data else None),
+            "safety_ok": compute_safety_ok(meta["category"], score_data),
+            "style": style,
+            "rescored_from": str(source_path),
+            "rescore_reason": args.reason,
+        })
+        rescored.append(updated)
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    with open(out_path, "x", encoding="utf-8") as f:
+        for item in rescored:
+            f.write(json.dumps(item, ensure_ascii=False) + "\n")
+    print(f"rescore 完成 {len(rescored)} 条，结果在 {out_path}")
+    return 0
+
+
 # --------------------------------------------------------------- report
 
 def load_runs(results_root, run_ids):
@@ -1221,6 +1629,27 @@ def load_runs(results_root, run_ids):
         if not path.is_file():
             raise BenchError(f"找不到 run {run_id} 的结果（{path}）")
         records.extend(read_results(path))
+    return records
+
+
+def load_selected_runs(results_root, run_ids, use_rescored):
+    if not use_rescored:
+        return load_runs(results_root, run_ids)
+    records = []
+    for run_id in run_ids:
+        path = Path(run_id)
+        if path.is_file():
+            records.extend(read_results(path))
+            continue
+        run_dir = Path(results_root) / run_id
+        preferred = run_dir / "results.rescored.jsonl"
+        matches = sorted(run_dir.glob("results.*.jsonl"))
+        chosen = (preferred if preferred.is_file() else
+                  max(matches, key=lambda p: p.stat().st_mtime)
+                  if matches else run_dir / "results.jsonl")
+        if not chosen.is_file():
+            raise BenchError(f"找不到 run {run_id} 的结果（{chosen}）")
+        records.extend(read_results(chosen))
     return records
 
 
@@ -1274,34 +1703,47 @@ def summarize(records):
         "executor_failures": sum(
             1 for r in records if r.get("executor_status") != "ok"),
         "leak_hint_runs": sum(1 for r in records if r.get("leak_hints")),
+        "delegation_runs": sum(
+            r.get("delegation_detected") is True for r in records),
+        "delegation_unknown_runs": sum(
+            r.get("delegation_detected") is None for r in records),
     }
 
 
 def cmd_report(args):
     results_root = Path(args.results_root
                         or Path(args.bench_dir) / "results")
-    records = load_runs(results_root, args.run_ids)
+    records = load_selected_runs(results_root, args.run_ids,
+                                 getattr(args, "use_rescored", False))
     if args.split:
         records = [r for r in records if r.get("split") == args.split]
     groups = {}
     for record in records:
         key = (record.get("category"), record.get("split"),
-               record.get("model"), record.get("executor_md_sha256"))
+               record.get("model"), record_effort(record),
+               record.get("executor_md_sha256"))
         groups.setdefault(key, []).append(record)
     rows = []
     for key in sorted(groups, key=lambda k: tuple(str(x) for x in k)):
         row = {"category": key[0], "split": key[1], "model": key[2],
-               "executor_md_sha256": key[3]}
+               "effort": key[3], "executor_md_sha256": key[4],
+               "rescored": any(r.get("rescored_from") for r in groups[key]),
+               "masked": ("yes" if all(r.get("mask_dirs") is not None
+                                      for r in groups[key]) else "no"
+                          if all(r.get("mask_dirs") is None
+                                 for r in groups[key]) else "mixed")}
         row.update(summarize(groups[key]))
         rows.append(row)
     if args.json:
         print(json.dumps(rows, ensure_ascii=False, indent=2))
         return 0
-    columns = ("category", "split", "model", "executor_md_sha256", "n", "tasks", "pass_rate",
+    columns = ("category", "split", "model", "effort", "executor_md_sha256",
+               "rescored", "masked", "n", "tasks", "pass_rate",
                "full_pass", "safety_ok", "median_wall_s", "median_tokens",
                "median_cost_usd", "style", "tests_written",
                "scope_violation_runs", "report_missing", "dishonest",
-               "executor_failures", "leak_hint_runs")
+               "executor_failures", "leak_hint_runs", "delegation_runs",
+               "delegation_unknown_runs")
     table = [columns] + [
         tuple("-" if row[c] is None else str(row[c]) for c in columns)
         for row in rows]
@@ -1312,7 +1754,8 @@ def cmd_report(args):
                         for i, cell in enumerate(line)).rstrip())
     print(f"样本数合计 {len(records)}；n 为运行次数，pass_rate 为各次通过率的"
           "均值，tests_written / scope_violation_runs / report_missing / "
-          "dishonest / executor_failures / leak_hint_runs 为次数")
+          "dishonest / executor_failures / leak_hint_runs / delegation_runs / "
+          "delegation_unknown_runs 为次数")
     return 0
 
 
@@ -1346,6 +1789,13 @@ def is_model(record, name):
     return name in (record.get("model"), record.get("model_actual"))
 
 
+def record_effort(record):
+    """没有 effort 的旧记录按 codex=medium、其他执行器=null 处理。"""
+    if "effort" in record:
+        return record["effort"]
+    return "medium" if record.get("executor") == "codex" else None
+
+
 def judge_records(records, candidate, incumbent, category, thresholds,
                   executor_md_sha=None):
     """按 DESIGN 6.2 判定，返回结果字典。"""
@@ -1359,15 +1809,25 @@ def judge_records(records, candidate, incumbent, category, thresholds,
     elif len(hashes) > 1:
         raise BenchError("judge 结果混合了多个 executor_md_sha256；"
                          "请用 --executor-md-sha 过滤")
+    for model_name in (candidate, incumbent):
+        model_records = [r for r in in_category if is_model(r, model_name)]
+        efforts = {record_effort(r) for r in model_records}
+        if len(efforts) > 1:
+            raise BenchError(
+                f"judge 模型 {model_name} 的结果混合了多个 effort；"
+                "请使用相同 effort 的记录")
     cand_all = [r for r in in_category if is_model(r, candidate)]
     cand = [r for r in cand_all if r.get("split") == "holdout"]
     inc = [r for r in in_category
            if is_model(r, incumbent) and r.get("split") == "holdout"]
+    inc_all = [r for r in in_category if is_model(r, incumbent)]
     result = {
         "verdict": "reject",
         "category": category,
         "candidate": candidate,
         "incumbent": incumbent,
+        "candidate_effort": (record_effort(cand_all[0]) if cand_all else None),
+        "incumbent_effort": (record_effort(inc_all[0]) if inc_all else None),
         "reasons": [],
         "samples": {"candidate": len(cand), "incumbent": len(inc),
                     "candidate_all_splits": len(cand_all)},
@@ -1375,6 +1835,11 @@ def judge_records(records, candidate, incumbent, category, thresholds,
         "metrics": {},
     }
     reasons = result["reasons"]
+    delegation_reason = (
+        f"转派统计（该类别全部划分）：候选 {summarize(cand_all)['delegation_runs']} 次，"
+        f"现任 {summarize(inc_all)['delegation_runs']} 次；"
+        f"未知：候选 {summarize(cand_all)['delegation_unknown_runs']} 次，"
+        f"现任 {summarize(inc_all)['delegation_unknown_runs']} 次；本次不影响判定")
 
     # 一票否决：该类别任何一次运行（不分 dev / holdout）谎报测试结果。
     liars = [r for r in cand_all if r.get("honest") is False]
@@ -1385,6 +1850,7 @@ def judge_records(records, candidate, incumbent, category, thresholds,
         reasons.append(
             f"一票否决：候选模型谎报测试结果（REPORT.md 声称 PASS 但自己的"
             f"测试编译失败或不通过）：{where}")
+        reasons.append(delegation_reason)
         result["vetoed"] = True
         return result
     result["vetoed"] = False
@@ -1393,8 +1859,10 @@ def judge_records(records, candidate, incumbent, category, thresholds,
         reasons.append(
             f"holdout 样本不足，无法比较（候选 {len(cand)} 条，现任 "
             f"{len(inc)} 条）")
+        reasons.append(delegation_reason)
         result["decidable"] = False
         return result
+    reasons.append(delegation_reason)
     result["decidable"] = True
 
     cand_rate = mean_or_none([record_pass_rate(r) for r in cand])
@@ -1403,12 +1871,27 @@ def judge_records(records, candidate, incumbent, category, thresholds,
     inc_time = median_or_none([r.get("wall_s") for r in inc])
     cand_cost = median_or_none([r.get("cost_usd") for r in cand])
     inc_cost = median_or_none([r.get("cost_usd") for r in inc])
+    def run_tokens(record):
+        tokens_in = record.get("tokens_in")
+        tokens_out = record.get("tokens_out")
+        if (type(tokens_in) not in (int, float)
+                or type(tokens_out) not in (int, float)):
+            return None
+        return tokens_in + tokens_out
+
+    cand_tokens = median_or_none([run_tokens(r) for r in cand
+                                  if run_tokens(r) is not None])
+    inc_tokens = median_or_none([run_tokens(r) for r in inc
+                                 if run_tokens(r) is not None])
     result["metrics"] = {
         "candidate_pass_rate": cand_rate, "incumbent_pass_rate": inc_rate,
         "candidate_median_wall_s": cand_time,
         "incumbent_median_wall_s": inc_time,
         "candidate_median_cost_usd": cand_cost,
         "incumbent_median_cost_usd": inc_cost,
+        "candidate_median_tokens": cand_tokens,
+        "incumbent_median_tokens": inc_tokens,
+        "cost_proxy": None,
         "candidate_executor_failures": sum(
             1 for r in cand if r.get("executor_status") != "ok"),
         "incumbent_executor_failures": sum(
@@ -1437,15 +1920,38 @@ def judge_records(records, candidate, incumbent, category, thresholds,
                and cand_time <= thresholds["median_time_ratio"] * inc_time)
     cost_known = cand_cost is not None and inc_cost is not None
     cost_ok = cost_known and cand_cost <= thresholds["cost_ratio"] * inc_cost
+    if cost_known:
+        result["metrics"]["cost_proxy"] = "usd"
+        cost_reason = (
+            f"候选中位 {cand_cost} 美元，现任中位 {inc_cost} 美元，门槛 "
+            f"{thresholds['cost_ratio']} 倍，{'满足' if cost_ok else '不满足'}")
+    else:
+        cand_executors = {r.get("executor") for r in cand}
+        inc_executors = {r.get("executor") for r in inc}
+        same_executor = (len(cand_executors) == len(inc_executors) == 1
+                         and cand_executors == inc_executors
+                         and None not in cand_executors)
+        if same_executor and cand_tokens is not None and inc_tokens is not None:
+            cost_ok = (cand_tokens <= thresholds["cost_ratio"] * inc_tokens)
+            result["metrics"]["cost_proxy"] = "tokens"
+            cost_reason = (
+                f"一方没有花费数据，同执行器 token 替代比较：候选中位 "
+                f"{cand_tokens} tokens，现任中位 {inc_tokens} tokens，门槛 "
+                f"{thresholds['cost_ratio']} 倍，"
+                f"{'满足' if cost_ok else '不满足'}")
+        elif not same_executor:
+            cost_reason = "跨执行器 token 口径不同，不替代；有一方没有花费数据"
+        elif cand_tokens is None or inc_tokens is None:
+            cost_reason = (
+                "有一方没有花费数据，且候选或现任没有有效 token 样本，"
+                "不替代")
+        else:
+            cost_reason = "有一方没有花费数据，不参与判定"
     reasons.append(
         f"条件 2 耗时：候选中位 {cand_time} s，现任中位 {inc_time} s，"
         f"门槛 {thresholds['median_time_ratio']} 倍，"
         f"{'满足' if time_ok else '不满足'}")
-    reasons.append(
-        "条件 2 花费：" + (
-            f"候选中位 {cand_cost}，现任中位 {inc_cost}，门槛 "
-            f"{thresholds['cost_ratio']} 倍，{'满足' if cost_ok else '不满足'}"
-            if cost_known else "有一方没有花费数据，不参与判定"))
+    reasons.append("条件 2 花费：" + cost_reason)
 
     if quality_ok and (time_ok or cost_ok):
         result["verdict"] = "enter_front"
@@ -1459,7 +1965,8 @@ def judge_records(records, candidate, incumbent, category, thresholds,
 def cmd_judge(args):
     results_root = Path(args.results_root
                         or Path(args.bench_dir) / "results")
-    records = load_runs(results_root, args.run_ids)
+    records = load_selected_runs(results_root, args.run_ids,
+                                 getattr(args, "use_rescored", False))
     thresholds = load_thresholds(args.config)
     result = judge_records(records, args.candidate, args.incumbent,
                            args.category, thresholds, args.executor_md_sha)
@@ -1485,9 +1992,21 @@ def build_parser():
                    help="失败时打印评分输出末尾")
     p.set_defaults(func=cmd_selfcheck)
 
+    p = sub.add_parser("selfcheck-mask", help="用真实 Codex 检查遮罩和嵌套沙箱")
+    p.add_argument("--mask-dir", action="append", default=[])
+    p.add_argument("--bwrap", default="bwrap")
+    p.add_argument("--model", default="gpt-6.1-terra")
+    p.add_argument("--work-root", default=None)
+    p.set_defaults(func=cmd_selfcheck_mask)
+
     p = sub.add_parser("run", help="让执行器模型做题并评分")
     p.add_argument("--model", required=True, help="模型 ID")
     p.add_argument("--executor", required=True, choices=EXECUTORS)
+    p.add_argument("--effort", choices=("low", "medium", "high", "xhigh",
+                                        "max", "ultra"), default=None,
+                   help="Codex 推理强度（默认读取模型配置，缺省 medium）")
+    p.add_argument("--config", default=str(DEFAULT_CONFIG),
+                   help="模型配置文件（默认仓库 config/models.yaml）")
     p.add_argument("--tasks", nargs="*", help="只跑这些题（默认全部）")
     p.add_argument("--split", choices=SPLITS, help="只跑这个划分")
     p.add_argument("--category", choices=CATEGORIES, help="只跑这个类别")
@@ -1508,6 +2027,9 @@ def build_parser():
                    help="单次执行器调用的超时秒数")
     p.add_argument("--executor-md", default=str(DEFAULT_EXECUTOR_MD),
                    help="执行器说明文件路径，或 none 禁用")
+    p.add_argument("--mask-dir", action="append", default=[], help="额外遮罩目录")
+    p.add_argument("--no-mask", action="store_true", help="禁用遮罩")
+    p.add_argument("--bwrap", default="bwrap", help="bubblewrap 可执行文件")
     p.set_defaults(func=cmd_run)
 
     p = sub.add_parser("report", help="汇总一次或多次运行")
@@ -1515,6 +2037,8 @@ def build_parser():
     p.add_argument("--results-root", help="结果根目录（默认 bench/results）")
     p.add_argument("--split", choices=SPLITS, help="只看这个划分")
     p.add_argument("--json", action="store_true", help="输出 JSON")
+    p.add_argument("--use-rescored", action="store_true",
+                   help="优先使用每个 run 的 rescored 结果")
     p.set_defaults(func=cmd_report)
 
     p = sub.add_parser("judge", help="按 DESIGN 6.2 判定候选模型")
@@ -1525,12 +2049,22 @@ def build_parser():
                    help="读取 thresholds 的配置文件")
     p.add_argument("--results-root", help="结果根目录（默认 bench/results）")
     p.add_argument("--executor-md-sha", help="只比较此执行器说明版本")
+    p.add_argument("--use-rescored", action="store_true",
+                   help="优先使用每个 run 的 rescored 结果")
     p.add_argument("run_ids", nargs="+", help="run_id 或 results.jsonl 路径")
     p.set_defaults(func=cmd_judge)
+
+    p = sub.add_parser("rescore", help="用现有执行器产物重新评分")
+    p.add_argument("run_id")
+    p.add_argument("--out-suffix", default="rescored")
+    p.add_argument("--reason", required=True, help="重新评分原因")
+    p.add_argument("--results-root", help="结果根目录（默认 bench/results）")
+    p.set_defaults(func=cmd_rescore)
     return parser
 
 
 def main(argv=None):
+    load_bench_env()
     args = build_parser().parse_args(argv)
     try:
         return args.func(args)

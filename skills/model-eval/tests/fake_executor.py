@@ -65,21 +65,64 @@ def apply_mode(mode, bench, task, ws):
 
 
 def emit(kind, model):
-    if kind == "codex":
-        print(json.dumps({"type": "thread.started", "thread_id": "t1"}))
+    if kind.startswith("codex"):
+        if kind == "codex_delegate":
+            print(json.dumps({"type": "item.completed", "item": {
+                "id": "item_1", "type": "command_execution",
+                "command": "claude -p 'solve this'", "exit_code": 0,
+                "status": "completed", "aggregated_output": "done"}}))
+        elif kind in ("codex_unknown", "codex_collab"):
+            print(json.dumps({"type": "item.completed", "item": {
+                "id": "item_1", "type": ("future_item" if kind == "codex_unknown"
+                                          else "collab_tool_call")}}))
+        thread_id = "t1"
+        if kind == "codex_rollouts":
+            thread_id = f"thread-{os.getpid()}"
+            sessions = Path(os.environ["CODEX_HOME"]) / "sessions/2026/11/13"
+            sessions.mkdir(parents=True, exist_ok=True)
+            for child, parent, child_model in (
+                    (thread_id + "-child", thread_id, "child-model"),
+                    (thread_id + "-foreign", "foreign-parent", "foreign-model")):
+                (sessions / f"rollout-{child}.jsonl").write_text(
+                    json.dumps({"payload": {"id": child,
+                        "thread_source": "subagent", "parent_thread_id": parent}})
+                    + "\n" + json.dumps({"payload": {"model": child_model}})
+                    + "\n", encoding="utf-8")
+        print(json.dumps({"type": "thread.started", "thread_id": thread_id}))
         print("not json at all")
         print(json.dumps({"type": "turn.completed", "usage": {
             "input_tokens": 100, "cached_input_tokens": 20,
             "output_tokens": 30}}))
-    elif kind == "claude":
+    elif kind.startswith("claude"):
+        name = "Agent" if kind == "claude_agent" else "Task"
+        if kind in ("claude_agent", "claude_task"):
+            block = {"type": "tool_use", "id": "toolu_1", "name": name,
+                     "input": {"prompt": "solve", "subagent_type": "general-purpose"}}
+        else:
+            command = ("codex exec 'solve'" if kind == "claude_bash"
+                       else "cat claude_test.cpp")
+            block = {"type": "tool_use", "id": "toolu_1", "name": "Bash",
+                     "input": {"command": command}}
+        print(json.dumps({"type": "assistant", "session_id": "s1",
+                          "message": {"role": "assistant",
+                                      "model": "claude-haiku-5-5",
+                                      "content": [block]}}))
+        model_usage = {"claude-haiku-5-5": {"outputTokens": 30}}
+        if kind == "claude_multi":
+            model_usage["claude-other"] = {"outputTokens": 1}
         print(json.dumps({
             "type": "result", "is_error": False, "result": "done",
             "total_cost_usd": 0.0123, "session_id": "s1",
             "usage": {"input_tokens": 10, "cache_creation_input_tokens": 5,
                       "cache_read_input_tokens": 85, "output_tokens": 30},
-            "modelUsage": {"claude-haiku-5-5": {"outputTokens": 30},
-                           "claude-other": {"outputTokens": 1}}}))
-    elif kind == "dsh":
+            "subagent_stats": {"spawned": 0},
+            "modelUsage": model_usage}))
+        # 确认解析读取最后一条 result，而非最后一条任意事件。
+        print(json.dumps({"type": "system", "subtype": "stop_hook_summary"}))
+    elif kind.startswith("dsh") and kind != "dsh_incomplete":
+        if kind == "dsh_delegate":
+            print(json.dumps({"type": "tool_call", "name": "bash",
+                              "arguments": {"command": "deepseek --help"}}))
         print(json.dumps({"type": "session", "session_id": "s1"}))
         print(json.dumps({"type": "thinking", "text": "working"}))
         print(json.dumps({"type": "status", "phase": "turn_end",

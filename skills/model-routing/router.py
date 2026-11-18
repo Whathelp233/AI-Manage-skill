@@ -14,8 +14,9 @@ except ImportError as exc:  # pragma: no cover - environment error
 
 EXECUTORS = {"codex", "claude", "dsh"}
 STATUSES = {"active", "candidate", "retired"}
+EFFORTS = {"low", "medium", "high", "xhigh", "max", "ultra"}
 CATEGORIES = {"A", "B", "C", "D"}
-OUTCOMES = {"pass", "fail_test", "fail_review", "regression", "test_gaming",
+OUTCOMES = {"pass", "partial", "fail_test", "fail_review", "regression", "test_gaming",
             "misunderstood", "quota", "env_error"}
 FIELDS = ("ts", "task_id", "project", "category", "executor", "model", "attempt",
           "outcome", "escalated_to", "wall_s", "tokens_in", "tokens_out", "cost_usd", "note")
@@ -44,7 +45,8 @@ def load_config(path):
     ids = set()
     for i, m in enumerate(pool):
         required = {"id", "executor", "status", "evaluated", "note"}
-        if not isinstance(m, dict) or not required <= set(m) or set(m) - required - {"alias"}:
+        if (not isinstance(m, dict) or not required <= set(m)
+                or set(m) - required - {"alias", "effort"}):
             raise RouterError(f"pool[{i}] must have id, executor, status, evaluated, note; alias is optional")
         if "alias" in m and (not isinstance(m["alias"], str) or not m["alias"].strip()):
             raise RouterError(f"pool[{i}].alias must be a non-empty string")
@@ -53,6 +55,14 @@ def load_config(path):
         ids.add(m["id"])
         if m["executor"] not in EXECUTORS or m["status"] not in STATUSES:
             raise RouterError(f"pool[{i}] has invalid executor or status")
+        if "effort" in m:
+            if m["executor"] != "codex":
+                raise RouterError(f"pool[{i}].effort is only valid for codex")
+            if (not isinstance(m["effort"], str)
+                    or m["effort"] not in EFFORTS):
+                raise RouterError(
+                    f"pool[{i}].effort must be one of "
+                    f"{', '.join(sorted(EFFORTS))}")
         if type(m["evaluated"]) is not bool or not isinstance(m["note"], str):
             raise RouterError(f"pool[{i}] evaluated must be boolean and note must be string")
     routing = data["routing"]
@@ -76,22 +86,33 @@ def load_config(path):
 
 def read_ledger(path):
     records = []
+    issues = []
     try:
         with open(path, encoding="utf-8") as f:
             for lineno, line in enumerate(f, 1):
                 if not line.strip():
-                    raise RouterError(f"invalid ledger {path}:{lineno}: blank lines are not allowed")
+                    issues.append((lineno, "blank lines are not allowed"))
+                    continue
                 try:
                     row = json.loads(line)
                     validate_record(row)
                 except (json.JSONDecodeError, RouterError) as e:
-                    raise RouterError(f"invalid ledger {path}:{lineno}: {e}")
+                    issues.append((lineno, str(e)))
+                    continue
                 records.append(row)
     except FileNotFoundError:
-        return []
+        return records, issues
     except OSError as e:
         raise RouterError(f"cannot read ledger {path}: {e}")
-    return records
+    return records, issues
+
+
+def report_ledger_issues(issues):
+    if issues:
+        print(f"warning: skipped {len(issues)} invalid ledger line(s)",
+              file=sys.stderr)
+        for lineno, reason in issues:
+            print(f"  line {lineno}: {reason}", file=sys.stderr)
 
 
 def parse_timestamp(value):
@@ -133,8 +154,11 @@ def cmd_route(args, cfg):
         raise RouterError("route category must be A, B, or C")
     by_id = {m["id"]: m for m in cfg["pool"]}
     for mid in cfg["routing"][args.category]:
-        if by_id[mid]["status"] == "active":
-            print(mid)
+        model = by_id[mid]
+        if model["status"] == "active":
+            effort = (model.get("effort", "medium")
+                      if model["executor"] == "codex" else "-")
+            print(f"{mid}\t{effort}")
 
 
 def cmd_log(args, cfg):
@@ -167,7 +191,8 @@ def cmd_log(args, cfg):
 
 
 def cmd_stats(args, cfg):
-    rows = read_ledger(args.ledger)
+    rows, issues = read_ledger(args.ledger)
+    report_ledger_issues(issues)
     if args.last is not None:
         if args.last <= 0:
             raise RouterError("--last must be a positive integer")
@@ -183,13 +208,16 @@ def cmd_stats(args, cfg):
         tasks = {}
         for r in records:
             tasks.setdefault(r["task_id"], []).append(r)
-        first = [r for r in records if r["attempt"] == 0]
+        first = [r for r in records
+                 if r["attempt"] == 0 and r["outcome"] != "partial"]
         first_pass = sum(r["outcome"] == "pass" for r in first) / len(first) if first else 0.0
+        partial_rate = sum(r["outcome"] == "partial" for r in records) / len(records)
         escalated = sum(bool(r["escalated_to"]) for r in records)
         reworked = sum(r["attempt"] > 0 for r in records)
         rounds = [max(r["attempt"] for r in task_rows) for task_rows in tasks.values() if any(r["attempt"] > 0 for r in task_rows)]
         print(json.dumps({"category": cat, "model": model, "records": len(records),
-                          "first_pass_rate": first_pass, "escalation_rate": escalated / len(records),
+                          "first_pass_rate": first_pass, "partial_rate": partial_rate,
+                          "escalation_rate": escalated / len(records),
                           "rework_rate": reworked / len(records),
                           "avg_rework_rounds": sum(rounds) / len(rounds) if rounds else 0.0}, ensure_ascii=False))
 
@@ -223,7 +251,9 @@ def cmd_detect(args, cfg):
 
 def cmd_check(args, cfg):
     by_cat = {}
-    for r in read_ledger(args.ledger):
+    rows, issues = read_ledger(args.ledger)
+    report_ledger_issues(issues)
+    for r in rows:
         by_cat.setdefault(r["category"], []).append(r)
     threshold = cfg["thresholds"]
     needed = []

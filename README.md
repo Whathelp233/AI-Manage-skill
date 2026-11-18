@@ -31,6 +31,7 @@ python3 skills/model-eval/bench.py --bench-dir /private/bench run \
     --executor-md /absolute/path/to/executor-dispatch/EXECUTOR.md
 python3 skills/model-eval/bench.py --bench-dir /private/bench judge \
     --config /private/models.yaml --candidate NEW --incumbent OLD --category A RUN_ID
+python3 -m unittest discover -s skills/executor-dispatch/tests -p 'test_*.py'
 python3 -m unittest discover -s skills/model-routing/tests -p 'test_*.py'
 python3 -m unittest discover -s skills/model-eval/tests -p 'test_*.py'
 ```
